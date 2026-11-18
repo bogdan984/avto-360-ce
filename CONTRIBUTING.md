@@ -333,36 +333,6 @@ Updater changes must preserve:
 
 Code signing is recommended for public releases but is not configured by default.
 
-## Release process
-
-Validate and build the current version locally:
-
-```powershell
-scripts\release.ps1 -Version 0.1.0
-```
-
-Dispatch a stable release workflow:
-
-```powershell
-scripts\release.ps1 -Version 0.2.0 -Publish
-```
-
-Dispatch a prerelease workflow:
-
-```powershell
-scripts\release.ps1 -Version 0.2.0-beta.1 -Prerelease -Publish
-```
-
-Release workflow responsibilities:
-
-- validate requested semantic version
-- update Cargo and Windows manifest versions
-- regenerate `Cargo.lock`
-- build the default-branch commit
-- produce the Windows executable asset
-- create the Git tag and GitHub release
-- mark prereleases correctly
-
 ## Automated checks
 
 Run before opening a pull request:
