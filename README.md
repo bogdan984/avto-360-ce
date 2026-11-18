@@ -1,118 +1,96 @@
-# x360ce
+# avto-360-ce (x360ce)
 
-<p align="center">
-  <img src="assets/x360ce.png" width="160" alt="x360ce controller icon">
-</p>
+Windows-программа, которая превращает руль, джойстик или геймпад в **виртуальный Xbox 360** и умеет больше обычного маппера:
+кнопки-модификаторы (слои), одиночное / двойное нажатие и удержание на одной кнопке, нажатие клавиш клавиатуры с контроллера.
+Интерфейс полностью на русском. Сделана для игр вроде SnowRunner, где на руле не хватает кнопок.
 
-`x360ce` lets a physical Windows controller behave like an Xbox 360 controller. Select a device, map its inputs visually, then keep the app in the tray while it forwards input to the virtual controller.
+Основана на [rozsazoltan/x360ce](https://github.com/rozsazoltan/x360ce) (AGPL-3.0).
 
-The project follows the familiar workflow of the original [`x360ce/x360ce`](https://github.com/x360ce/x360ce), with a focused Windows interface, live input preview, per-controller profiles, and portable settings.
+## Что умеет
 
-- [Get started](#get-started)
-- [Mapping](#mapping)
-- [Tray mode](#tray-mode)
-- [Profiles](#profiles)
-- [Troubleshooting](#troubleshooting)
-- [License](#license)
+### Модификаторы (слои)
 
-## Get started
+Любая кнопка, хатка или ось может стать **модификатором** (до 4). Пока модификатор зажат, остальные кнопки работают по назначениям его слоя, а их обычное действие блокируется.
 
-> [!IMPORTANT]
-> x360ce requires 64-bit Windows 10 or Windows 11 and the ViGEmBus driver. The app can open the bundled driver installer when ViGEmBus is missing.
+У каждого модификатора свой режим:
 
-1. Download the latest `x360ce.exe` from Releases.
-2. Move it to a permanent, writable folder.
-3. Start x360ce and install ViGEmBus when prompted.
-4. Restart x360ce, connect the controller, then select it under **Input controller**.
-5. Map the controls and move x360ce to the tray.
-
-Settings and profiles are saved beside the executable, so the application remains portable.
-
-## Mapping
-
-Choose a control on the virtual Xbox 360 layout or in the mapping list. Double-click it, then press a physical button or move an axis. Press `Esc` to cancel learning.
-
-| State | Meaning |
+| Режим | Что делает |
 |---|---|
-| White | Mapped |
-| Green | Currently active |
-| Yellow with `!` | Not mapped |
-| Blue | Waiting for learned input |
+| Только слой | Кнопка только переключает слой, сама ничего не нажимает |
+| Слой + своё действие при одиночном нажатии | Если кнопку нажали и отпустили без комбинации, срабатывают её назначения из основного слоя (коротким импульсом) |
+| Слой + обычная кнопка | Кнопка работает и как модификатор, и как обычная |
 
-Buttons, triggers, D-pad directions, stick axes, and stick clicks can be mapped independently. A missing mapping is valid when the physical controller has fewer controls.
+Слой выбирается в момент нажатия кнопки и держится, пока её не отпустят. Если отпустить модификатор раньше целевой кнопки, обычное действие не сработает и ничего не залипнет.
 
-For axes, x360ce detects positive and negative movement separately. Use **Source direction** or **Invert output** when an axis moves the wrong way. Deadzone and saturation controls can refine stick behavior, while **Centered/split source axis** supports controllers that expose both triggers through one shared axis.
+В интерфейсе: блок «Модификаторы и слои» → «+ Добавить модификатор» → нажать кнопку на контроллере. Переключатель «Редактируемый слой» (Основной / Модификатор N) меняет, что редактируется на картинке контроллера и в списке назначений. Стики назначаются только в основном слое.
 
-Use the remove button beside a mapping to clear only that control. The **Live physical input** panel shows raw axes, buttons, and hats from the selected device.
+### Типы нажатия
 
-## Tray mode
+Для кнопки на контроллере выбирается тип нажатия:
 
-Closing the window hides x360ce instead of stopping it. Use **Quit x360ce** from the tray menu to remove the virtual controller completely.
+| Тип | Когда срабатывает |
+|---|---|
+| Прямое | Сразу, пока кнопка зажата. Без задержки. По умолчанию |
+| Одиночное | Короткое нажатие. Если на этой же кнопке есть «Двойное» или «Удержание», срабатывает после окна ожидания или при отпускании |
+| Двойное | Два нажатия подряд в пределах окна (по умолчанию 250 мс) |
+| Удержание | Кнопка удержана дольше порога (по умолчанию 350 мс) |
 
-When **Forward only in tray** is enabled, physical input remains visible while configuring the app, but virtual output stays paused until x360ce is hidden. This prevents test presses from controlling Windows, games, or other applications during mapping.
+Тайминги настраиваются ползунками в блоке «Модификаторы и слои». Кнопки Xbox при двойном нажатии и удержании остаются нажатыми, пока зажата физическая кнопка. Одиночное, сработавшее после окна ожидания, — короткий импульс (около 40 мс). Для клавиш клавиатуры действует выбранный режим (удерживать или импульс).
 
-Automatic tray mode can hide the window after an idle period. Mouse, keyboard, or controller activity cancels its countdown.
+### Клавиатура
 
-x360ce also suppresses Guide/Nexus output and silently handles Windows Game Bar protocol requests, preventing Xbox Game Bar or its missing-application dialog from appearing.
+Любая кнопка контроллера (в любом слое и с любым типом нажатия) может нажимать клавиши Windows:
 
-## Profiles
+- клавиша выбирается нажатием на клавиатуре («Захват клавиши») или из выпадающего списка;
+- можно добавить Ctrl, Shift, Alt, Win;
+- режим: «Удерживать, пока зажата» или «Короткий импульс».
 
-Each controller receives its own profile. Use **Export** to save the selected mapping as JSON and **Import** to restore or share it.
+Клавиши отправляются через SendInput со скан-кодами (подходит для игр на DirectInput/RawInput). При выключении эмуляции, выходе из программы и смене контроллера все программно зажатые клавиши отпускаются.
 
-Portable application data is stored here:
+**Безопасная настройка.** Пока включена галочка «Работать только в трее» и окно программы открыто, ни клавиши, ни виртуальный геймпад не работают: руль не будет случайно жать клавиши в блокноте. Всё включается, когда программа свёрнута в трей.
 
-```text
-.x360ce-data\config.json
+### «Игровые устройства» (joy.cpl)
+
+Некоторые драйверы (например, Saitek/Logitech X52) отдают часть кнопок только пока открыты «Свойства» устройства. Программа открывает их сама и уводит окно за край экрана; при выходе закрывает. Настройки в блоке «Игровые устройства (joy.cpl)»:
+
+- «Открывать свойства устройства при запуске»;
+- имя устройства в joy.cpl (пусто — выбранный контроллер);
+- кнопки «Открыть свойства» и «Закрыть».
+
+### Профили
+
+Назначения хранятся отдельно для каждого контроллера. «Экспорт» и «Импорт» сохраняют и переносят профиль целиком в JSON, вместе с модификаторами, клавиатурными назначениями и таймингами. Старые профили загружаются как есть.
+
+## Примеры (SnowRunner)
+
+| Что хочется | Как настроить |
+|---|---|
+| Левый лепесток + A = блокировка дифференциала | Модификатор 1 = левый лепесток; выбрать слой «Модификатор 1» и назначить нужную кнопку Xbox (которая в игре включает блокировку) на физическую кнопку A |
+| Кнопка B = клавиша F (лебёдка) | Блок «Клавиатура» → кнопка B → клавиша F |
+| Лепесток + B = клавиша R (отцепить лебёдку) | Блок «Клавиатура», слой «Модификатор 1», кнопка B, клавиша R |
+| Кнопка X: одиночное — фары, двойное — сигнал, удержание — двигатель | Для X добавить три назначения с типами «Одиночное», «Двойное», «Удержание» |
+| Двойное нажатие Start = клавиша M (карта) | Блок «Клавиатура» → Start → тип «Двойное» → M |
+
+## Установка и запуск
+
+1. Скачайте `x360ce-vX.Y.Z-windows-x64.exe` со страницы [Releases](https://github.com/bogdan984/avto-360-ce/releases) и положите в отдельную папку (настройки хранятся рядом, в `.x360ce-data\config.json`).
+2. Запустите. Если нужного драйвера нет, нажмите «Установить драйвер» (установщик ViGEmBus вшит в программу) и после установки перезапустите x360ce.
+3. Выберите контроллер, назначьте кнопки (двойной щелчок по кнопке на картинке или «Назначить»).
+4. Сверните программу в трей (или подождите авто-сворачивания) — тогда виртуальный Xbox 360 и клавиатура заработают.
+
+Требуется Windows x64 и драйвер [ViGEmBus](https://github.com/nefarius/ViGEmBus).
+
+## Сборка
+
+```
+cargo build --release --bin x360ce
+cargo test --bin x360ce
 ```
 
-Back up `x360ce.exe` together with `.x360ce-data` when moving the application to another computer or folder.
+Тесты автомата нажатий (аккорды, разделение одиночного/двойного/удержания, отсутствие залипания) лежат в `src/mapper.rs`. Подробности для разработчиков: [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## Troubleshooting
+Релиз собирается автоматически (GitHub Actions) при пуше тега вида `v0.2.0`.
 
-<details>
-<summary>Virtual Xbox 360 controller does not appear</summary>
+## Лицензия
 
-Install ViGEmBus from x360ce, restart the app, and confirm that emulation is enabled. When **Forward only in tray** is active, hide x360ce before testing. Games already running may need to be restarted.
-
-</details>
-
-<details>
-<summary>Physical controller is missing</summary>
-
-Reconnect the controller, press **Refresh**, or try another USB or Bluetooth connection. Close other controller tools that may hold exclusive device access.
-
-</details>
-
-<details>
-<summary>Axis or trigger moves incorrectly</summary>
-
-Change **Source direction**, enable **Invert output**, or use **Centered/split source axis** for shared trigger axes.
-
-</details>
-
-<details>
-<summary>Inputs appear twice in a game</summary>
-
-Windows still exposes the physical controller while x360ce creates a virtual one. Games that read both devices may require a separate physical-device hiding solution such as HidHide.
-
-</details>
-
-<details>
-<summary>Xbox Game Bar dialog still appears</summary>
-
-Quit every running x360ce instance, start the latest build once so its silent protocol handlers are registered, then hide it to the tray and test the Guide/Nexus button again.
-
-</details>
-
-<details>
-<summary>Settings are not saved</summary>
-
-Keep x360ce in a folder writable by the current user. Avoid protected locations such as `C:\Program Files` unless permissions are configured manually.
-
-</details>
-
-## License
-
-x360ce is open source under the [GNU Affero General Public License v3.0 or later](LICENSE). Third-party notices are available in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
-Development, testing, and contribution documentation lives in [CONTRIBUTING.md](CONTRIBUTING.md).
+AGPL-3.0-or-later, см. [LICENSE](LICENSE) и [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
