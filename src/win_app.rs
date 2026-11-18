@@ -23,7 +23,7 @@ use crate::{
     game_bar, joycpl, mapper,
     model::{
         entry_mut_in, key_name, ControllerProfile, InputBinding, KeyOutput, KeyboardMapping,
-        MappingEntry, ModifierConfig, ModifierMode, OutputControl, PressMode, RawState,
+        MappingEntry, ModifierConfig, ModifierMode, OutputControl, PaddleAxis, PressMode, RawState,
         RuntimeSnapshot, TriggerType, KEYS, MAX_MODIFIERS,
     },
     profile_io,
@@ -1784,6 +1784,99 @@ impl X360ceApp {
         });
     }
 
+    fn render_paddles(&mut self, ui: &mut egui::Ui) {
+        surface(ui, |ui| {
+            ui.label(RichText::new("Педали и лепестки на одной оси").strong());
+            ui.label(
+                RichText::new(
+                    "Если лепесток двигает ту же ось, что и педаль: быстрый скачок оси до упора \
+                     считается лепестком — это отдельный вход, его можно назначить на любую \
+                     кнопку или клавишу. Педаль в это время держит своё значение.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
+            ui.add_space(6.0);
+
+            let profile = self.current_profile();
+            let raw = self.runtime.raw_state.clone();
+            let mut updated = None;
+            let mut remove = None;
+            for (index, item) in profile.paddle_axes.iter().enumerate() {
+                let mut next = *item;
+                let axis_count = raw.axes.len().max(next.axis as usize + 1);
+                ui.horizontal_wrapped(|ui| {
+                    egui::ComboBox::from_id_salt(("paddle-axis", index))
+                        .selected_text(format!("Ось {}", next.axis + 1))
+                        .show_ui(ui, |ui| {
+                            for axis in 0..axis_count as u32 {
+                                ui.selectable_value(
+                                    &mut next.axis,
+                                    axis,
+                                    format!("Ось {}", axis + 1),
+                                );
+                            }
+                        });
+                    for negative in [true, false] {
+                        let on = raw.paddles.contains(&(next.axis, negative));
+                        status_chip(
+                            ui,
+                            &format!("лепесток {}", if negative { "-" } else { "+" }),
+                            if on { SUCCESS } else { SURFACE_MUTED },
+                            on,
+                        );
+                    }
+                    if ui.button("×").on_hover_text("Убрать разделение").clicked()
+                    {
+                        remove = Some(index);
+                    }
+                });
+                ui.add(
+                    egui::Slider::new(&mut next.min_jump, 0.15..=0.8)
+                        .text("Минимальный скачок, доля хода")
+                        .fixed_decimals(2),
+                );
+                ui.add(egui::Slider::new(&mut next.window_ms, 10..=60).text("Окно скачка, мс"));
+                if next != *item {
+                    updated = Some((index, next));
+                }
+            }
+            if let Some((index, item)) = updated {
+                self.current_profile_mut().paddle_axes[index] = item;
+                self.profile_changed();
+            }
+            if let Some(index) = remove {
+                self.current_profile_mut().paddle_axes.remove(index);
+                self.profile_changed();
+            }
+            if ui.button("+ Разделить педаль и лепестки на оси").clicked()
+            {
+                // Предлагаем ось, которая сейчас сильнее всего отклонена.
+                let axis = raw
+                    .axes
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, value)| value.unsigned_abs())
+                    .map(|(index, _)| index as u32)
+                    .unwrap_or_default();
+                self.current_profile_mut()
+                    .paddle_axes
+                    .push(PaddleAxis::new(axis));
+                self.profile_changed();
+            }
+            ui.label(
+                RichText::new(
+                    "Проверка: нажмите лепесток — загорается «лепесток»; плавно и резко \
+                     нажмите педаль — не должен. Если педаль ловится как лепесток, увеличьте \
+                     «Минимальный скачок» или уменьшите «Окно». Лепесток, нажатый при \
+                     полностью выжатой педали, распознать нельзя: ось уже у упора.",
+                )
+                .size(10.0)
+                .color(MUTED),
+            );
+        });
+    }
+
     fn render_raw_inputs(&mut self, ui: &mut egui::Ui) {
         surface(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1834,6 +1927,18 @@ impl X360ceApp {
                             WARNING
                         },
                         *hat != crate::model::HatDirection::Centered,
+                    );
+                }
+                for (axis, negative) in &self.runtime.raw_state.paddles {
+                    status_chip(
+                        ui,
+                        &format!(
+                            "Лепесток оси {} {}",
+                            axis + 1,
+                            if *negative { "-" } else { "+" }
+                        ),
+                        SUCCESS,
+                        true,
                     );
                 }
             });
@@ -2210,6 +2315,8 @@ fn ui_root(app: &mut X360ceApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                             app.render_layers(ui);
                             ui.add_space(8.0);
                             app.render_keyboard(ui);
+                            ui.add_space(8.0);
+                            app.render_paddles(ui);
                             ui.add_space(8.0);
                             app.render_raw_inputs(ui);
                         });
@@ -2597,6 +2704,13 @@ fn control_preview_active(
 }
 
 fn primary_live_input_label(raw: &RawState) -> String {
+    if let Some((axis, negative)) = raw.paddles.first() {
+        return InputBinding::Paddle {
+            axis: *axis,
+            negative: *negative,
+        }
+        .label();
+    }
     for (index, pressed) in raw.buttons.iter().enumerate() {
         if *pressed {
             return format!("Кнопка {}", index + 1);

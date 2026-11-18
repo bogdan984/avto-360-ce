@@ -3,6 +3,7 @@ use crate::{
     keyboard_output::KeyboardOutput,
     mapper::MapperState,
     model::{ControllerProfile, DeviceDescriptor, HatDirection, RawState, RuntimeSnapshot},
+    paddle::PaddleFilter,
     virtual_gamepad::VirtualGamepad,
 };
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -114,6 +115,7 @@ fn run_worker(
     let mut joystick = open_selected(&joystick_subsystem, &devices, &selected_guid);
     let mut virtual_gamepad: Option<VirtualGamepad> = None;
     let mut mapper_state = MapperState::default();
+    let mut paddle_filter = PaddleFilter::default();
     // Объявлена после SDL: при выходе из функции отпускает все клавиши.
     let mut keyboard = KeyboardOutput::default();
     let mut previous_raw = RawState::default();
@@ -132,6 +134,7 @@ fn run_worker(
                     joystick = open_selected(&joystick_subsystem, &devices, &selected_guid);
                     previous_raw = RawState::default();
                     mapper_state.reset();
+                    paddle_filter.reset();
                     virtual_gamepad = None;
                     next_virtual_connect_attempt = Instant::now();
                     last_virtual_error = None;
@@ -176,11 +179,12 @@ fn run_worker(
         }
 
         joystick_subsystem.update();
-        let raw = joystick
+        let mut raw = joystick
             .as_ref()
             .filter(|device| device.attached())
             .map(read_raw_state)
             .unwrap_or_default();
+        paddle_filter.apply(&profile.paddle_axes, &mut raw, Instant::now());
         let active = has_activity(&previous_raw, &raw);
         if active {
             sequence = sequence.wrapping_add(1);
@@ -319,6 +323,7 @@ fn read_raw_state(joystick: &sdl2::joystick::Joystick) -> RawState {
         axes,
         buttons,
         hats,
+        paddles: Vec::new(),
     }
 }
 
@@ -337,7 +342,10 @@ fn convert_hat(value: HatState) -> HatDirection {
 }
 
 fn has_activity(previous: &RawState, current: &RawState) -> bool {
-    if current.buttons != previous.buttons || current.hats != previous.hats {
+    if current.buttons != previous.buttons
+        || current.hats != previous.hats
+        || current.paddles != previous.paddles
+    {
         return true;
     }
     let max_axes = current.axes.len().max(previous.axes.len());

@@ -19,6 +19,12 @@ pub fn detect_binding(previous: &RawState, current: &RawState) -> Option<InputBi
         }
     }
 
+    for (axis, negative) in current.paddles.iter().copied() {
+        if !previous.paddles.contains(&(axis, negative)) {
+            return Some(InputBinding::Paddle { axis, negative });
+        }
+    }
+
     for (index, direction) in current.hats.iter().copied().enumerate() {
         let previous_direction = previous
             .hats
@@ -482,6 +488,15 @@ impl MapperState {
                         direction: *direction,
                     }),
             )
+            .chain(
+                raw.paddles
+                    .iter()
+                    .filter(|paddle| !self.previous.paddles.contains(paddle))
+                    .map(|(axis, negative)| InputBinding::Paddle {
+                        axis: *axis,
+                        negative: *negative,
+                    }),
+            )
             .collect();
         for modifier in &profile.modifiers {
             let other_pressed = newly_pressed
@@ -558,6 +573,7 @@ pub fn input_pressed(binding: InputBinding, raw: &RawState) -> bool {
             .copied()
             .unwrap_or(HatDirection::Centered)
             .contains(direction),
+        InputBinding::Paddle { axis, negative } => raw.paddles.contains(&(axis, negative)),
     }
 }
 
@@ -566,6 +582,13 @@ pub fn axis_preview(entry: &MappingEntry, raw: &RawState) -> f32 {
         InputBinding::None => 0.0,
         InputBinding::Button { index } => {
             if raw.buttons.get(index as usize).copied().unwrap_or(false) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        InputBinding::Paddle { .. } => {
+            if input_pressed(entry.binding, raw) {
                 1.0
             } else {
                 0.0
@@ -609,6 +632,13 @@ pub fn trigger_preview(entry: &MappingEntry, raw: &RawState) -> f32 {
         InputBinding::None => 0.0,
         InputBinding::Button { index } => {
             if raw.buttons.get(index as usize).copied().unwrap_or(false) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        InputBinding::Paddle { .. } => {
+            if input_pressed(entry.binding, raw) {
                 1.0
             } else {
                 0.0
@@ -726,6 +756,27 @@ mod tests {
             detect_binding(&previous, &current),
             Some(InputBinding::Button { index: 0 })
         );
+    }
+
+    #[test]
+    fn learns_paddle_and_maps_it_as_button() {
+        let previous = RawState::default();
+        let current = RawState {
+            paddles: vec![(2, false)],
+            ..Default::default()
+        };
+        let binding = detect_binding(&previous, &current).unwrap();
+        assert_eq!(
+            binding,
+            InputBinding::Paddle {
+                axis: 2,
+                negative: false
+            }
+        );
+        let mut profile = ControllerProfile::default_for(String::new());
+        profile.entries = vec![MappingEntry::new(OutputControl::RightShoulder, binding)];
+        let out = MapperState::default().update(&profile, &current, Instant::now());
+        assert!(out.report.buttons.contains(X360Button::RIGHT_SHOULDER));
     }
 
     #[test]

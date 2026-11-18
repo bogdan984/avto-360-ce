@@ -17,6 +17,8 @@ mod keyboard_output;
 #[cfg(windows)]
 mod mapper;
 #[cfg(windows)]
+mod paddle;
+#[cfg(windows)]
 mod profile_io;
 #[cfg(windows)]
 mod single_instance;

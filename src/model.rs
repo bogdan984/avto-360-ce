@@ -59,6 +59,9 @@ pub struct RawState {
     pub buttons: Vec<bool>,
     #[serde(default)]
     pub hats: Vec<HatDirection>,
+    /// Зажатые лепестки на общей с педалью оси: (индекс оси, отрицательное направление).
+    #[serde(default)]
+    pub paddles: Vec<(u32, bool)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +82,11 @@ pub enum InputBinding {
         index: u32,
         direction: HatDirection,
     },
+    /// Лепесток, отделённый от педали на той же оси (см. [`PaddleAxis`]).
+    Paddle {
+        axis: u32,
+        negative: bool,
+    },
 }
 
 impl InputBinding {
@@ -90,6 +98,13 @@ impl InputBinding {
             Self::AxisNegative { index } => format!("Ось {} -", index + 1),
             Self::Hat { index, direction } => {
                 format!("Хатка {} {}", index + 1, direction.label())
+            }
+            Self::Paddle { axis, negative } => {
+                format!(
+                    "Лепесток оси {} {}",
+                    axis + 1,
+                    if *negative { "-" } else { "+" }
+                )
             }
         }
     }
@@ -418,6 +433,37 @@ impl MappingEntry {
     }
 }
 
+/// Ось, которую двигают и педаль, и лепесток: быстрый скачок до упора —
+/// лепесток, плавное движение — педаль.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaddleAxis {
+    pub axis: u32,
+    /// Минимальный скачок (доля хода) за окно, чтобы считать его лепестком.
+    #[serde(default = "default_paddle_min_jump")]
+    pub min_jump: f32,
+    /// Окно скачка, мс.
+    #[serde(default = "default_paddle_window_ms")]
+    pub window_ms: u32,
+}
+
+impl PaddleAxis {
+    pub fn new(axis: u32) -> Self {
+        Self {
+            axis,
+            min_jump: default_paddle_min_jump(),
+            window_ms: default_paddle_window_ms(),
+        }
+    }
+}
+
+fn default_paddle_min_jump() -> f32 {
+    0.35
+}
+
+fn default_paddle_window_ms() -> u32 {
+    25
+}
+
 /// Максимум кнопок-модификаторов (слоёв) в профиле.
 pub const MAX_MODIFIERS: usize = 4;
 
@@ -433,6 +479,8 @@ pub struct ControllerProfile {
     pub keyboard: Vec<KeyboardMapping>,
     #[serde(default)]
     pub timings: Timings,
+    #[serde(default)]
+    pub paddle_axes: Vec<PaddleAxis>,
 }
 
 impl ControllerProfile {
@@ -519,6 +567,7 @@ impl ControllerProfile {
             modifiers: Vec::new(),
             keyboard: Vec::new(),
             timings: Timings::default(),
+            paddle_axes: Vec::new(),
         }
     }
 
