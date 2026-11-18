@@ -5,13 +5,13 @@ resolver = "2"
 [package]
 name = "x360ce"
 default-run = "x360ce"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.92"
 build = "build.rs"
 license = "AGPL-3.0-or-later"
 description = "minimal Windows controller mapper with virtual Xbox 360 output"
-repository = "https://github.com/rozsazoltan/x360ce"
+repository = "https://github.com/bogdan984/avto-360-ce"
 
 [dependencies]
 anyhow = "1.0"
@@ -29,8 +29,11 @@ tray-icon = { version = "=0.24.1", default-features = false, features = ["common
 vigem-rust = { version = "=0.1.1", default-features = false, features = ["x360"] }
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

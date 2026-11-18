@@ -20,8 +20,12 @@ use crate::{
     config::{self, SavedState},
     driver,
     engine::{ControllerEngine, EngineCommand},
-    game_bar, mapper,
-    model::{ControllerProfile, InputBinding, OutputControl, RawState, RuntimeSnapshot},
+    game_bar, joycpl, mapper,
+    model::{
+        entry_mut_in, key_name, ControllerProfile, InputBinding, KeyOutput, KeyboardMapping,
+        MappingEntry, ModifierConfig, ModifierMode, OutputControl, PressMode, RawState,
+        RuntimeSnapshot, TriggerType, KEYS, MAX_MODIFIERS,
+    },
     profile_io,
     single_instance::BuildKind,
     startup, updater,
@@ -35,6 +39,8 @@ const MIN_WINDOW_HEIGHT: f32 = 780.0;
 const VISIBLE_POLL: Duration = Duration::from_millis(16);
 const HIDDEN_POLL: Duration = Duration::from_millis(120);
 const AUTO_UPDATE_INTERVAL_SECONDS: u64 = 60 * 60;
+/// Сколько максимум ждать, пока движок найдёт контроллер, прежде чем открыть joy.cpl.
+const JOYCPL_AUTOSTART_DELAY: Duration = Duration::from_secs(6);
 
 const BACKGROUND: Color32 = Color32::from_rgb(242, 244, 247);
 const SURFACE: Color32 = Color32::from_rgb(255, 255, 255);
@@ -114,7 +120,7 @@ pub fn run() -> Result<()> {
             Ok(Box::new(X360ceApp::new(creation_context, state, visible)))
         }),
     )
-    .map_err(|error| anyhow::anyhow!("failed to run x360ce UI: {error}"))
+    .map_err(|error| anyhow::anyhow!("не удалось запустить интерфейс x360ce: {error}"))
 }
 
 struct TrayState {
@@ -128,41 +134,41 @@ struct TrayState {
 impl TrayState {
     fn new(state: &SavedState, update_installable: bool) -> Result<Self> {
         let menu = Menu::new();
-        let open = MenuItem::with_id(MENU_OPEN, "Open x360ce", true, None);
+        let open = MenuItem::with_id(MENU_OPEN, "Открыть x360ce", true, None);
         let enabled = CheckMenuItem::with_id(
             MENU_ENABLED,
-            "Virtual controller enabled",
+            "Виртуальный контроллер включён",
             true,
             state.emulation_enabled,
             None,
         );
         let auto_tray = CheckMenuItem::with_id(
             MENU_AUTO_TRAY,
-            "Auto tray after inactivity",
+            "Сворачивать в трей при бездействии",
             true,
             state.auto_tray_enabled,
             None,
         );
         let startup = CheckMenuItem::with_id(
             MENU_STARTUP,
-            "Start with Windows",
+            "Запускать вместе с Windows",
             !config::is_dev_build(),
             state.startup_enabled && !config::is_dev_build(),
             None,
         );
         let check = MenuItem::with_id(
             MENU_CHECK,
-            "Check for updates",
+            "Проверить обновления",
             !config::is_dev_build(),
             None,
         );
         let install = MenuItem::with_id(
             MENU_INSTALL,
-            "Install available update",
+            "Установить обновление",
             update_installable && !config::is_dev_build(),
             None,
         );
-        let quit = MenuItem::with_id(MENU_QUIT, "Quit x360ce", true, None);
+        let quit = MenuItem::with_id(MENU_QUIT, "Выйти из x360ce", true, None);
         let separator = PredefinedMenuItem::separator();
         let separator_updates = PredefinedMenuItem::separator();
         let separator_quit = PredefinedMenuItem::separator();
@@ -231,6 +237,14 @@ struct X360ceApp {
     countdown_started: Option<Instant>,
     update_rx: Option<Receiver<anyhow::Result<updater::UpdateCheck>>>,
     last_update_check: Option<updater::UpdateCheck>,
+    /// Редактируемый слой: None — основной, Some(n) — модификатор n.
+    edit_layer: Option<usize>,
+    learning_modifier: Option<usize>,
+    learning_keyboard_input: Option<usize>,
+    learning_key: Option<usize>,
+    joycpl_pid: Option<u32>,
+    joycpl_rx: Option<Receiver<Result<u32, String>>>,
+    joycpl_autostart_at: Option<Instant>,
 }
 
 impl X360ceApp {
@@ -269,13 +283,16 @@ impl X360ceApp {
         );
         let game_bar_result = game_bar::install_hard_block();
         let mut status = if state.last_status.is_empty() {
-            "Ready.".to_owned()
+            "Готово.".to_owned()
         } else {
             state.last_status.clone()
         };
         if let Err(error) = game_bar_result {
-            status = format!("Xbox Game Bar shortcut update failed: {error}");
+            status = format!("Не удалось обновить блокировку Xbox Game Bar: {error}");
         }
+        let joycpl_autostart_at = state
+            .joycpl_on_start
+            .then(|| Instant::now() + JOYCPL_AUTOSTART_DELAY);
         let tray = TrayState::new(&state, false).ok();
         let controller_texture = load_controller_texture(&creation_context.egui_ctx);
 
@@ -298,7 +315,53 @@ impl X360ceApp {
             countdown_started: None,
             update_rx: None,
             last_update_check: None,
+            edit_layer: None,
+            learning_modifier: None,
+            learning_keyboard_input: None,
+            learning_key: None,
+            joycpl_pid: None,
+            joycpl_rx: None,
+            joycpl_autostart_at,
         }
+    }
+
+    /// Профиль, в котором `entries` — назначения редактируемого слоя.
+    fn edit_view(&self) -> ControllerProfile {
+        let mut profile = self.current_profile();
+        if let Some(layer) = self.edit_layer {
+            profile.entries = profile.layer_entries(Some(layer)).to_vec();
+        }
+        profile
+    }
+
+    fn edit_entry_mut(&mut self, control: OutputControl) -> &mut MappingEntry {
+        let layer = self.edit_layer;
+        let profile = self.current_profile_mut();
+        match layer.filter(|layer| *layer < profile.modifiers.len()) {
+            Some(layer) => entry_mut_in(&mut profile.modifiers[layer].entries, control),
+            None => profile.entry_mut(control),
+        }
+    }
+
+    fn layer_name(layer: Option<usize>) -> String {
+        match layer {
+            None => "Основной".to_owned(),
+            Some(index) => format!("Модификатор {}", index + 1),
+        }
+    }
+
+    fn profile_changed(&mut self) {
+        self.push_profile();
+        self.save();
+        self.mark_activity();
+    }
+
+    fn cancel_learning(&mut self) {
+        self.learning_control = None;
+        self.learning_output_negative = false;
+        self.learning_modifier = None;
+        self.learning_keyboard_input = None;
+        self.learning_key = None;
     }
 
     fn current_profile(&self) -> ControllerProfile {
@@ -326,7 +389,7 @@ impl X360ceApp {
     fn save(&mut self) {
         self.state.last_status = self.status.clone();
         if let Err(error) = config::save_state(&self.state) {
-            self.status = format!("Save failed: {error}");
+            self.status = format!("Не удалось сохранить: {error}");
         }
     }
 
@@ -351,7 +414,7 @@ impl X360ceApp {
         self.current_profile_mut();
         self.engine.send(EngineCommand::SelectDevice(guid));
         self.push_profile();
-        self.status = "Controller selected.".to_owned();
+        self.status = "Контроллер выбран.".to_owned();
         self.mark_activity();
         self.save();
     }
@@ -360,9 +423,9 @@ impl X360ceApp {
         self.state.emulation_enabled = enabled;
         self.engine.send(EngineCommand::SetEnabled(enabled));
         self.status = if enabled {
-            "Virtual controller enabled.".to_owned()
+            "Виртуальный контроллер включён.".to_owned()
         } else {
-            "Virtual controller paused.".to_owned()
+            "Виртуальный контроллер приостановлен.".to_owned()
         };
         self.mark_activity();
         self.save();
@@ -428,7 +491,7 @@ impl X360ceApp {
         let countdown = Duration::from_secs(self.state.auto_tray_countdown_seconds.max(1));
         if started.elapsed() >= countdown {
             self.hide_window(ctx);
-            self.status = "Moved to tray after inactivity.".to_owned();
+            self.status = "Свёрнуто в трей из-за бездействия.".to_owned();
             self.save();
         }
     }
@@ -440,11 +503,38 @@ impl X360ceApp {
     }
 
     fn poll_learning(&mut self) {
-        let Some(control) = self.learning_control else {
+        if self.learning_modifier.is_none()
+            && self.learning_keyboard_input.is_none()
+            && self.learning_control.is_none()
+        {
             return;
-        };
+        }
         let Some(binding) = mapper::detect_binding(&self.learn_baseline, &self.runtime.raw_state)
         else {
+            return;
+        };
+
+        if let Some(index) = self.learning_modifier.take() {
+            if let Some(modifier) = self.current_profile_mut().modifiers.get_mut(index) {
+                modifier.binding = binding;
+            }
+            self.status = format!("Модификатор {}: {}.", index + 1, binding.label());
+            self.profile_changed();
+            return;
+        }
+        if let Some(index) = self.learning_keyboard_input.take() {
+            if let Some(mapping) = self.current_profile_mut().keyboard.get_mut(index) {
+                mapping.input = binding;
+            }
+            self.status = format!(
+                "Клавиатурное назначение {}: {}.",
+                index + 1,
+                binding.label()
+            );
+            self.profile_changed();
+            return;
+        }
+        let Some(control) = self.learning_control else {
             return;
         };
 
@@ -466,7 +556,7 @@ impl X360ceApp {
         };
         let output_negative = self.learning_output_negative;
         {
-            let mapping = self.current_profile_mut().entry_mut(control);
+            let mapping = self.edit_entry_mut(control);
             mapping.binding = binding;
             mapping.centered_axis = centered_axis;
             if control.is_axis() {
@@ -478,7 +568,7 @@ impl X360ceApp {
 
         self.learning_control = None;
         self.learning_output_negative = false;
-        self.status = format!("{} mapped to {}.", control.label(), binding.label());
+        self.status = format!("{}: {}.", control.label(), binding.label());
         self.push_profile();
         self.save();
     }
@@ -488,6 +578,12 @@ impl X360ceApp {
     }
 
     fn begin_learning_with_direction(&mut self, control: OutputControl, output_negative: bool) {
+        self.cancel_learning();
+        if self.edit_layer.is_some() && control.is_axis() {
+            self.selected_control = control;
+            self.status = "Стики назначаются только в основном слое.".to_owned();
+            return;
+        }
         self.selected_control = control;
         self.selected_axis_negative = control.is_axis().then_some(output_negative);
         self.learning_control = Some(control);
@@ -495,30 +591,143 @@ impl X360ceApp {
         self.learn_baseline = self.runtime.raw_state.clone();
         let direction = if control.is_axis() {
             if output_negative {
-                "negative output"
+                "отрицательное направление"
             } else {
-                "positive output"
+                "положительное направление"
             }
         } else {
-            "input"
+            "кнопку или ось"
         };
-        self.status = format!("Move or press {direction} for {}.", control.label());
+        self.status = format!(
+            "Нажмите или отклоните {direction} для «{}».",
+            control.label()
+        );
         self.mark_activity();
     }
 
+    fn begin_learning_input(&mut self, modifier: Option<usize>, keyboard: Option<usize>) {
+        self.cancel_learning();
+        self.learning_modifier = modifier;
+        self.learning_keyboard_input = keyboard;
+        self.learn_baseline = self.runtime.raw_state.clone();
+        self.status = "Нажмите кнопку на контроллере (Esc — отмена).".to_owned();
+        self.mark_activity();
+    }
+
+    fn begin_learning_key(&mut self, index: usize) {
+        self.cancel_learning();
+        self.learning_key = Some(index);
+        self.status = "Нажмите клавишу на клавиатуре (Esc — отмена).".to_owned();
+        self.mark_activity();
+    }
+
+    /// Захват клавиши клавиатуры для назначения (режим «Захват клавиши»).
+    fn poll_key_capture(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.learning_key else {
+            return;
+        };
+        let pressed = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } if *key != egui::Key::Escape => egui_key_to_vk(*key),
+                _ => None,
+            })
+        });
+        let Some(vk) = pressed else {
+            return;
+        };
+        if let Some(mapping) = self.current_profile_mut().keyboard.get_mut(index) {
+            mapping.key.vk = vk;
+        }
+        self.learning_key = None;
+        self.status = format!("Клавиша: {}.", key_name(vk));
+        self.profile_changed();
+    }
+
+    fn start_joycpl(&mut self) {
+        if self.joycpl_rx.is_some() {
+            return;
+        }
+        let name = if self.state.joycpl_device_name.trim().is_empty() {
+            self.runtime
+                .devices
+                .iter()
+                .find(|device| device.guid == self.state.selected_device_guid)
+                .map(|device| device.name.clone())
+                .unwrap_or_default()
+        } else {
+            self.state.joycpl_device_name.clone()
+        };
+        let previous = self.joycpl_pid.take();
+        let (sender, receiver) = unbounded();
+        thread::spawn(move || {
+            if let Some(pid) = previous {
+                joycpl::close(pid);
+            }
+            // После включения ПК список joy.cpl заполняется не сразу.
+            let mut result = Err(String::new());
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    thread::sleep(Duration::from_secs(3));
+                }
+                result = joycpl::open(&name);
+                if result.is_ok() {
+                    break;
+                }
+            }
+            let _ = sender.send(result);
+        });
+        self.joycpl_rx = Some(receiver);
+        self.status = "Открываю «Игровые устройства» (joy.cpl)…".to_owned();
+    }
+
+    fn close_joycpl(&mut self) {
+        if let Some(pid) = self.joycpl_pid.take() {
+            thread::spawn(move || joycpl::close(pid));
+            self.status = "Свойства устройства (joy.cpl) закрыты.".to_owned();
+        }
+    }
+
+    fn poll_joycpl(&mut self) {
+        if let Some(at) = self.joycpl_autostart_at {
+            let device_known = !self.state.joycpl_device_name.trim().is_empty()
+                || self
+                    .runtime
+                    .devices
+                    .iter()
+                    .any(|device| device.guid == self.state.selected_device_guid);
+            if device_known || Instant::now() >= at {
+                self.joycpl_autostart_at = None;
+                self.start_joycpl();
+            }
+        }
+        let Some(result) = self.joycpl_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else {
+            return;
+        };
+        self.joycpl_rx = None;
+        match result {
+            Ok(pid) => {
+                self.joycpl_pid = Some(pid);
+                self.status = "Свойства устройства открыты (окно за краем экрана).".to_owned();
+            }
+            Err(error) => self.status = format!("joy.cpl: {error}"),
+        }
+    }
+
     fn clear_mapping(&mut self, control: OutputControl) {
-        self.current_profile_mut().entry_mut(control).binding = InputBinding::None;
+        self.edit_entry_mut(control).binding = InputBinding::None;
         self.learning_control = None;
         self.learning_output_negative = false;
         self.selected_axis_negative = None;
-        self.status = format!("{} mapping cleared.", control.label());
+        self.status = format!("Назначение «{}» очищено.", control.label());
         self.push_profile();
         self.save();
     }
 
     fn set_axis_binding_direction(&mut self, control: OutputControl, positive: bool) {
         let changed = {
-            let mapping = self.current_profile_mut().entry_mut(control);
+            let mapping = self.edit_entry_mut(control);
             let next = match mapping.binding {
                 InputBinding::AxisPositive { index } | InputBinding::AxisNegative { index } => {
                     if positive {
@@ -538,7 +747,7 @@ impl X360ceApp {
         };
         if changed {
             self.status = format!(
-                "{} source direction set to {}.",
+                "Направление источника для «{}»: {}.",
                 control.label(),
                 if positive { "+" } else { "-" }
             );
@@ -551,13 +760,13 @@ impl X360ceApp {
     fn export_current_mapping(&mut self) {
         match profile_io::export_profile(&self.current_profile()) {
             Ok(Some(path)) => {
-                self.status = format!("Mapping exported: {}", path.display());
+                self.status = format!("Назначения экспортированы: {}", path.display());
             }
             Ok(None) => {
-                self.status = "Mapping export canceled.".to_owned();
+                self.status = "Экспорт отменён.".to_owned();
             }
             Err(error) => {
-                self.status = format!("Mapping export failed: {error}");
+                self.status = format!("Ошибка экспорта: {error}");
             }
         }
     }
@@ -568,22 +777,23 @@ impl X360ceApp {
                 let guid = self.state.selected_device_guid.clone();
                 profile.device_guid = guid.clone();
                 if profile.name.trim().is_empty() {
-                    profile.name = "Imported profile".to_owned();
+                    profile.name = "Импортированный профиль".to_owned();
                 }
                 self.state.profiles.insert(guid, profile.clone());
                 self.engine.send(EngineCommand::SetProfile(profile));
+                self.edit_layer = None;
                 self.learning_control = None;
                 self.learning_output_negative = false;
                 self.selected_axis_negative = None;
-                self.status = format!("Mapping imported: {}", path.display());
+                self.status = format!("Назначения импортированы: {}", path.display());
                 self.save();
                 self.mark_activity();
             }
             Ok(None) => {
-                self.status = "Mapping import canceled.".to_owned();
+                self.status = "Импорт отменён.".to_owned();
             }
             Err(error) => {
-                self.status = format!("Mapping import failed: {error}");
+                self.status = format!("Ошибка импорта: {error}");
             }
         }
     }
@@ -628,7 +838,7 @@ impl X360ceApp {
 
     fn toggle_startup(&mut self) {
         if config::is_dev_build() {
-            self.status = "Startup disabled in development builds.".to_owned();
+            self.status = "Автозапуск недоступен в сборке для разработки.".to_owned();
             return;
         }
         let enabled = !self.state.startup_enabled;
@@ -636,14 +846,14 @@ impl X360ceApp {
             Ok(()) => {
                 self.state.startup_enabled = enabled;
                 self.status = if enabled {
-                    "Windows startup enabled.".to_owned()
+                    "Автозапуск с Windows включён.".to_owned()
                 } else {
-                    "Windows startup disabled.".to_owned()
+                    "Автозапуск с Windows выключен.".to_owned()
                 };
                 self.save();
                 self.sync_tray();
             }
-            Err(error) => self.status = format!("Startup update failed: {error}"),
+            Err(error) => self.status = format!("Не удалось изменить автозапуск: {error}"),
         }
     }
 
@@ -670,7 +880,7 @@ impl X360ceApp {
             let _ = sender.send(result);
         });
         self.update_rx = Some(receiver);
-        self.status = "Checking GitHub releases…".to_owned();
+        self.status = "Проверка релизов на GitHub…".to_owned();
     }
 
     fn poll_update_check(&mut self) {
@@ -688,7 +898,7 @@ impl X360ceApp {
                 self.status = update_status(&check);
                 self.last_update_check = Some(check);
             }
-            Err(error) => self.status = format!("Update check failed: {error}"),
+            Err(error) => self.status = format!("Ошибка проверки обновлений: {error}"),
         }
         self.save();
         self.sync_tray();
@@ -696,11 +906,11 @@ impl X360ceApp {
 
     fn install_update(&mut self) {
         let Some(check) = self.last_update_check.clone() else {
-            self.status = "No checked update available.".to_owned();
+            self.status = "Нет проверенного обновления.".to_owned();
             return;
         };
         if let Err(error) = updater::install_update(&check) {
-            self.status = format!("Update install failed: {error}");
+            self.status = format!("Ошибка установки обновления: {error}");
         }
     }
 
@@ -722,7 +932,7 @@ impl X360ceApp {
         let Some(remaining) = self.countdown_remaining() else {
             return;
         };
-        egui::Window::new("Moving to tray")
+        egui::Window::new("Сворачивание в трей")
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -735,9 +945,9 @@ impl X360ceApp {
                             .strong()
                             .color(ACCENT),
                     );
-                    ui.label("No activity. x360ce keeps forwarding in tray.");
+                    ui.label("Нет активности. x360ce продолжит работу в трее.");
                     ui.add_space(8.0);
-                    if ui.button("Stay open").clicked() {
+                    if ui.button("Не сворачивать").clicked() {
                         self.mark_activity();
                     }
                 });
@@ -752,12 +962,13 @@ impl eframe::App for X360ceApp {
             self.hide_window(ctx);
         }
 
-        if self.learning_control.is_some()
-            && ctx.input(|input| input.key_pressed(egui::Key::Escape))
-        {
-            self.learning_control = None;
-            self.learning_output_negative = false;
-            self.status = "Mapping capture canceled.".to_owned();
+        let learning = self.learning_control.is_some()
+            || self.learning_modifier.is_some()
+            || self.learning_keyboard_input.is_some()
+            || self.learning_key.is_some();
+        if learning && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.cancel_learning();
+            self.status = "Захват назначения отменён.".to_owned();
             self.mark_activity();
         }
 
@@ -765,6 +976,8 @@ impl eframe::App for X360ceApp {
         self.poll_tray(ctx);
         self.poll_activity(ctx);
         self.poll_learning();
+        self.poll_key_capture(ctx);
+        self.poll_joycpl();
         self.poll_auto_tray(ctx);
         self.maybe_start_automatic_update_check();
         self.poll_update_check();
@@ -783,6 +996,9 @@ impl eframe::App for X360ceApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save();
+        if let Some(pid) = self.joycpl_pid.take() {
+            joycpl::close(pid);
+        }
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -797,13 +1013,13 @@ impl X360ceApp {
             ui.vertical(|ui| {
                 ui.label(RichText::new("x360ce").size(26.0).strong().color(TEXT));
                 ui.label(
-                    RichText::new("controller mapper and virtual xbox 360 output")
+                    RichText::new("переназначение контроллера и виртуальный Xbox 360")
                         .size(12.0)
                         .color(MUTED),
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("tray").clicked() {
+                if ui.button("В трей").clicked() {
                     self.hide_window(ui.ctx());
                 }
                 ui.label(RichText::new(config::app_version_label()).color(MUTED));
@@ -813,15 +1029,15 @@ impl X360ceApp {
 
     fn render_status(&mut self, ui: &mut egui::Ui) {
         let (label, color) = if !self.runtime.driver_installed {
-            ("driver missing", WARNING)
+            ("нет драйвера", WARNING)
         } else if self.window_visible && self.state.forward_only_in_tray {
-            ("configuring", ACCENT)
+            ("настройка", ACCENT)
         } else if self.runtime.virtual_connected {
-            ("forwarding", SUCCESS)
+            ("работает", SUCCESS)
         } else if !self.state.emulation_enabled {
-            ("paused", MUTED)
+            ("пауза", MUTED)
         } else {
-            ("waiting", WARNING)
+            ("ожидание", WARNING)
         };
 
         let runtime_error = self.runtime.last_error.clone();
@@ -831,18 +1047,18 @@ impl X360ceApp {
                 status_chip(
                     ui,
                     if self.window_visible && self.state.forward_only_in_tray {
-                        "output isolated"
+                        "вывод отключён"
                     } else if self.state.emulation_enabled {
-                        "virtual on"
+                        "виртуальный вкл"
                     } else {
-                        "virtual off"
+                        "виртуальный выкл"
                     },
                     ACCENT_SOFT,
                     false,
                 );
                 status_chip(
                     ui,
-                    &format!("{} detected", self.runtime.devices.len()),
+                    &format!("найдено: {}", self.runtime.devices.len()),
                     SURFACE_MUTED,
                     false,
                 );
@@ -852,33 +1068,34 @@ impl X360ceApp {
                     .map(|check| check.is_update_available)
                     .unwrap_or(false)
                 {
-                    status_chip(ui, "update available", WARNING, true);
+                    status_chip(ui, "есть обновление", WARNING, true);
                 }
 
                 ui.add_space(6.0);
                 ui.label(RichText::new(&self.status).size(11.0).color(MUTED));
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if !self.runtime.driver_installed && ui.button("Install driver").clicked() {
+                    if !self.runtime.driver_installed && ui.button("Установить драйвер").clicked()
+                    {
                         match driver::launch_installer_elevated() {
-                            Ok(_) => {
-                                self.status =
-                                    "Driver installer opened. Restart x360ce after install."
-                                        .to_owned()
+                            Ok(_) => self.status =
+                                "Установщик драйвера открыт. После установки перезапустите x360ce."
+                                    .to_owned(),
+                            Err(error) => {
+                                self.status = format!("Ошибка установщика драйвера: {error}")
                             }
-                            Err(error) => self.status = format!("Driver installer failed: {error}"),
                         }
                     }
-                    if ui.button("Refresh").clicked() {
+                    if ui.button("Обновить").clicked() {
                         self.engine.send(EngineCommand::Refresh);
-                        self.status = "Refreshing controllers…".to_owned();
+                        self.status = "Обновление списка контроллеров…".to_owned();
                         self.mark_activity();
                     }
                     if ui
                         .button(if self.state.emulation_enabled {
-                            "Disable"
+                            "Выключить"
                         } else {
-                            "Enable"
+                            "Включить"
                         })
                         .clicked()
                     {
@@ -897,10 +1114,10 @@ impl X360ceApp {
     fn render_device_bar(&mut self, ui: &mut egui::Ui) {
         surface(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Input controller").strong());
+                ui.label(RichText::new("Физический контроллер").strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(format!("{} detected", self.runtime.devices.len()))
+                        RichText::new(format!("найдено: {}", self.runtime.devices.len()))
                             .size(11.0)
                             .color(MUTED),
                     );
@@ -914,7 +1131,7 @@ impl X360ceApp {
                 .iter()
                 .find(|device| device.guid == self.state.selected_device_guid)
                 .map(|device| ellipsize(&device.name, 34))
-                .unwrap_or_else(|| "No controller detected".to_owned());
+                .unwrap_or_else(|| "Контроллер не найден".to_owned());
             let combo_width = (ui.available_width() - 76.0).clamp(160.0, 280.0);
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("controller-selector")
@@ -924,7 +1141,7 @@ impl X360ceApp {
                         let devices = self.runtime.devices.clone();
                         for device in devices {
                             let label = format!(
-                                "{} · {} axes · {} buttons · {} hats",
+                                "{} · осей: {} · кнопок: {} · хаток: {}",
                                 device.name, device.axes, device.buttons, device.hats
                             );
                             if ui
@@ -938,9 +1155,9 @@ impl X360ceApp {
                             }
                         }
                     });
-                if ui.button("Refresh").clicked() {
+                if ui.button("Обновить").clicked() {
                     self.engine.send(EngineCommand::Refresh);
-                    self.status = "Refreshing controllers…".to_owned();
+                    self.status = "Обновление списка контроллеров…".to_owned();
                     self.mark_activity();
                 }
             });
@@ -951,37 +1168,59 @@ impl X360ceApp {
         surface(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("Virtual Xbox 360 layout").strong());
+                    ui.label(RichText::new("Раскладка виртуального Xbox 360").strong());
                     ui.label(
-                        RichText::new("Click to select · double-click to learn · Esc to cancel")
-                            .size(11.0)
-                            .color(MUTED),
+                        RichText::new(
+                            "Щелчок — выбрать · двойной щелчок — назначить · Esc — отмена",
+                        )
+                        .size(11.0)
+                        .color(MUTED),
                     );
                 });
                 if let Some(control) = self.learning_control {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        status_chip(ui, &format!("learning {}", control.label()), ACCENT, true);
+                        status_chip(
+                            ui,
+                            &format!("назначение: {}", control.label()),
+                            ACCENT,
+                            true,
+                        );
                     });
                 }
             });
 
             ui.add_space(4.0);
             let width = ui.available_width();
-            let height = (width * 0.62).clamp(240.0, 310.0);
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+            let height = (width * 0.62).clamp(260.0, 340.0);
+            let (area, _) = ui.allocate_exact_size(egui::vec2(width, height), Sense::hover());
+            // Сверху место под триггеры, картинка вписывается с сохранением пропорций.
+            let image_area = egui::Rect::from_min_max(
+                egui::pos2(area.left(), area.top() + height * 0.16),
+                area.max,
+            );
+            let image_height = image_area
+                .height()
+                .min(image_area.width() / CONTROLLER_IMAGE_ASPECT);
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(
+                    image_area.center().x,
+                    image_area.bottom() - image_height * 0.5,
+                ),
+                egui::vec2(image_height * CONTROLLER_IMAGE_ASPECT, image_height),
+            );
             let texture_id = self.controller_texture.as_ref().map(|texture| texture.id());
             if let Some(texture_id) = texture_id {
                 ui.painter().image(
                     texture_id,
                     rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.13), egui::pos2(1.0, 0.88)),
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
             } else {
                 draw_controller_body(ui, rect);
             }
 
-            let profile = self.current_profile();
+            let profile = self.edit_view();
             for (control, x, y) in controller_points() {
                 let center = egui::pos2(
                     rect.left() + rect.width() * x,
@@ -1014,8 +1253,8 @@ impl X360ceApp {
                 &profile,
                 true,
                 egui::pos2(
-                    rect.left() + rect.width() * 0.365,
-                    rect.top() + rect.height() * 0.54,
+                    rect.left() + rect.width() * 0.360,
+                    rect.top() + rect.height() * 0.471,
                 ),
             );
             draw_stick_controls(
@@ -1024,8 +1263,8 @@ impl X360ceApp {
                 &profile,
                 false,
                 egui::pos2(
-                    rect.left() + rect.width() * 0.635,
-                    rect.top() + rect.height() * 0.54,
+                    rect.left() + rect.width() * 0.642,
+                    rect.top() + rect.height() * 0.471,
                 ),
             );
         });
@@ -1034,8 +1273,13 @@ impl X360ceApp {
     fn render_mapping_editor(&mut self, ui: &mut egui::Ui) {
         surface(ui, |ui| {
             let control = self.selected_control;
-            let profile = self.current_profile();
+            let profile = self.edit_view();
             let selected_entry = profile.entry(control).cloned();
+            ui.label(
+                RichText::new(format!("Слой: {}", Self::layer_name(self.edit_layer)))
+                    .size(11.0)
+                    .color(ACCENT),
+            );
             let selected_mapped = selected_entry
                 .as_ref()
                 .map(|entry| entry.binding != InputBinding::None)
@@ -1058,37 +1302,72 @@ impl X360ceApp {
 
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Learn").clicked() {
+                if ui.button("Назначить").clicked() {
                     self.begin_learning(control);
                 }
                 if ui
-                    .add_enabled(selected_mapped, egui::Button::new("Clear"))
+                    .add_enabled(selected_mapped, egui::Button::new("Очистить"))
                     .clicked()
                 {
                     self.clear_mapping(control);
                 }
-                if ui.button("Export").clicked() {
+                if ui.button("Экспорт").clicked() {
                     self.export_current_mapping();
                 }
-                if ui.button("Import").clicked() {
+                if ui.button("Импорт").clicked() {
                     self.import_mapping();
                 }
             });
             ui.label(
                 RichText::new(format!(
-                    "Detected: {}",
+                    "Сейчас нажато: {}",
                     primary_live_input_label(&self.runtime.raw_state)
                 ))
                 .size(11.0)
                 .color(MUTED),
             );
 
-            if control.is_axis() || control.is_trigger() {
+            if !control.is_axis() && (self.edit_layer.is_none() || selected_mapped) {
+                let current = selected_entry
+                    .as_ref()
+                    .map(|entry| entry.trigger)
+                    .unwrap_or_default();
+                let mut next = current;
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Тип нажатия").size(11.0).color(MUTED));
+                    egui::ComboBox::from_id_salt("trigger-type")
+                        .selected_text(current.label())
+                        .show_ui(ui, |ui| {
+                            for trigger in TriggerType::ALL {
+                                ui.selectable_value(&mut next, trigger, trigger.label());
+                            }
+                        });
+                });
+                if next != current {
+                    self.edit_entry_mut(control).trigger = next;
+                    self.status = format!("{}: тип нажатия «{}».", control.label(), next.label());
+                    self.profile_changed();
+                }
+            }
+
+            if control.is_axis() && self.edit_layer.is_some() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Стики работают только в основном слое.")
+                        .size(11.0)
+                        .color(WARNING),
+                );
+            } else if control.is_axis() || control.is_trigger() {
                 ui.add_space(8.0);
                 if let Some(binding) = selected_entry.as_ref().map(|entry| entry.binding) {
                     if let Some(positive) = axis_binding_positive(binding) {
                         ui.horizontal(|ui| {
-                            ui.label(RichText::new("Source direction").size(11.0).color(MUTED));
+                            ui.label(
+                                RichText::new("Направление источника")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
                             if ui.selectable_label(positive, "+").clicked() {
                                 self.set_axis_binding_direction(control, true);
                             }
@@ -1101,26 +1380,26 @@ impl X360ceApp {
 
                 let mut changed = false;
                 {
-                    let mapping = self.current_profile_mut().entry_mut(control);
+                    let mapping = self.edit_entry_mut(control);
                     ui.horizontal_wrapped(|ui| {
-                        changed |= ui.checkbox(&mut mapping.invert, "Invert output").changed();
+                        changed |= ui.checkbox(&mut mapping.invert, "Инвертировать").changed();
                         if control.is_trigger() {
                             changed |= ui
-                                .checkbox(&mut mapping.centered_axis, "Split axis")
+                                .checkbox(&mut mapping.centered_axis, "Половина оси")
                                 .changed();
                         }
                     });
                     changed |= ui
                         .add(
                             egui::Slider::new(&mut mapping.deadzone, 0.0..=0.5)
-                                .text("Deadzone")
+                                .text("Мёртвая зона")
                                 .fixed_decimals(2),
                         )
                         .changed();
                     changed |= ui
                         .add(
                             egui::Slider::new(&mut mapping.saturation, 0.5..=1.0)
-                                .text("Max")
+                                .text("Максимум")
                                 .fixed_decimals(2),
                         )
                         .changed();
@@ -1134,10 +1413,10 @@ impl X360ceApp {
 
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Mappings").strong());
+                ui.label(RichText::new("Назначения").strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new("double-click to learn · × to clear")
+                        RichText::new("двойной щелчок — назначить · × — очистить")
                             .size(10.0)
                             .color(MUTED),
                     );
@@ -1145,9 +1424,11 @@ impl X360ceApp {
             });
             ui.add_space(4.0);
 
+            let layer = self.edit_layer;
             let controls: Vec<OutputControl> = OutputControl::BUTTONS
                 .into_iter()
                 .chain(OutputControl::ANALOGS)
+                .filter(|control| layer.is_none() || !control.is_axis())
                 .collect();
             let split = controls.len().div_ceil(2);
             ui.columns(2, |columns| {
@@ -1163,18 +1444,20 @@ impl X360ceApp {
                                     control_preview_active(*item, entry, &self.runtime.raw_state)
                                 })
                                 .unwrap_or(false);
-                            let label = if mapped {
+                            let label = if !mapped && layer.is_some() {
+                                format!("{} · —", compact_control_label(*item))
+                            } else if mapped {
                                 format!(
                                     "{} · {}",
                                     compact_control_label(*item),
                                     entry_label_for(&profile, *item)
                                 )
                             } else {
-                                format!("! {} · Not mapped", compact_control_label(*item))
+                                format!("! {} · Не назначено", compact_control_label(*item))
                             };
                             let rich = if active {
                                 RichText::new(label).strong().color(SUCCESS)
-                            } else if mapped {
+                            } else if mapped || layer.is_some() {
                                 RichText::new(label).size(11.0).color(TEXT)
                             } else {
                                 RichText::new(label)
@@ -1191,7 +1474,7 @@ impl X360ceApp {
                                         ui.selectable_label(self.selected_control == *item, rich);
                                     clear_clicked = ui
                                         .add_enabled(mapped, egui::Button::new("×"))
-                                        .on_hover_text("Clear mapping")
+                                        .on_hover_text("Очистить назначение")
                                         .clicked();
                                     response
                                 })
@@ -1213,10 +1496,298 @@ impl X360ceApp {
         });
     }
 
+    fn render_layers(&mut self, ui: &mut egui::Ui) {
+        surface(ui, |ui| {
+            ui.label(RichText::new("Модификаторы и слои").strong());
+            ui.label(
+                RichText::new(
+                    "Пока модификатор зажат, кнопки работают по назначениям его слоя, \
+                     а их обычное действие блокируется. Модификатором может быть любая кнопка.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
+            ui.add_space(6.0);
+
+            let profile = self.current_profile();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Редактируемый слой:").size(11.0).color(MUTED));
+                let layers = std::iter::once(None).chain((0..profile.modifiers.len()).map(Some));
+                for layer in layers {
+                    if ui
+                        .selectable_label(self.edit_layer == layer, Self::layer_name(layer))
+                        .clicked()
+                    {
+                        self.edit_layer = layer;
+                        self.cancel_learning();
+                        self.mark_activity();
+                    }
+                }
+            });
+            ui.add_space(4.0);
+
+            let mut remove = None;
+            let mut learn = None;
+            let mut new_mode = None;
+            for (index, modifier) in profile.modifiers.iter().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Модификатор {}:", index + 1)).strong());
+                    let held = mapper::input_pressed(modifier.binding, &self.runtime.raw_state);
+                    let text = if self.learning_modifier == Some(index) {
+                        RichText::new("нажмите кнопку…").color(ACCENT)
+                    } else if modifier.binding == InputBinding::None {
+                        RichText::new("не назначен").color(WARNING)
+                    } else if held {
+                        RichText::new(modifier.binding.label())
+                            .strong()
+                            .color(SUCCESS)
+                    } else {
+                        RichText::new(modifier.binding.label()).color(TEXT)
+                    };
+                    ui.label(text);
+                    if ui.button("Назначить").clicked() {
+                        learn = Some(index);
+                    }
+                    let mut mode = modifier.mode;
+                    egui::ComboBox::from_id_salt(("modifier-mode", index))
+                        .selected_text(mode.label())
+                        .width(250.0)
+                        .show_ui(ui, |ui| {
+                            for item in ModifierMode::ALL {
+                                ui.selectable_value(&mut mode, item, item.label());
+                            }
+                        });
+                    if mode != modifier.mode {
+                        new_mode = Some((index, mode));
+                    }
+                    if ui
+                        .button("×")
+                        .on_hover_text("Удалить модификатор")
+                        .clicked()
+                    {
+                        remove = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = learn {
+                self.begin_learning_input(Some(index), None);
+            }
+            if let Some((index, mode)) = new_mode {
+                self.current_profile_mut().modifiers[index].mode = mode;
+                self.status = format!("Модификатор {}: {}.", index + 1, mode.label());
+                self.profile_changed();
+            }
+            if let Some(index) = remove {
+                self.current_profile_mut().remove_modifier(index);
+                self.edit_layer = None;
+                self.cancel_learning();
+                self.status = format!("Модификатор {} удалён.", index + 1);
+                self.profile_changed();
+            }
+            if ui
+                .add_enabled(
+                    profile.modifiers.len() < MAX_MODIFIERS,
+                    egui::Button::new("+ Добавить модификатор"),
+                )
+                .clicked()
+            {
+                let index = {
+                    let profile = self.current_profile_mut();
+                    profile.modifiers.push(ModifierConfig::default());
+                    profile.modifiers.len() - 1
+                };
+                self.profile_changed();
+                self.begin_learning_input(Some(index), None);
+            }
+            ui.label(
+                RichText::new(
+                    "«Своё действие при одиночном нажатии» — назначения этой кнопки в основном \
+                     слое срабатывают коротким нажатием, если её отпустили без комбинации.",
+                )
+                .size(10.0)
+                .color(MUTED),
+            );
+
+            ui.add_space(8.0);
+            ui.label(RichText::new("Тайминги").strong());
+            let mut timings = profile.timings;
+            ui.add(
+                egui::Slider::new(&mut timings.double_tap_window_ms, 100..=800)
+                    .text("Окно двойного нажатия, мс"),
+            );
+            ui.add(
+                egui::Slider::new(&mut timings.hold_threshold_ms, 150..=2000)
+                    .text("Порог удержания, мс"),
+            );
+            if timings != profile.timings {
+                self.current_profile_mut().timings = timings;
+                self.profile_changed();
+            }
+            ui.label(
+                RichText::new(
+                    "«Прямое» срабатывает без задержки. Если на кнопке есть «Двойное» или \
+                     «Удержание», «Одиночное» срабатывает после окна ожидания или при отпускании.",
+                )
+                .size(10.0)
+                .color(MUTED),
+            );
+        });
+    }
+
+    fn render_keyboard(&mut self, ui: &mut egui::Ui) {
+        surface(ui, |ui| {
+            ui.label(RichText::new("Клавиатура").strong());
+            ui.label(
+                RichText::new(
+                    "Кнопки контроллера нажимают клавиши Windows. При включённом «Работать \
+                     только в трее» клавиши отправляются, только когда окно свёрнуто в трей.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
+            ui.add_space(6.0);
+
+            let profile = self.current_profile();
+            let layers: Vec<Option<usize>> = std::iter::once(None)
+                .chain((0..profile.modifiers.len()).map(Some))
+                .collect();
+            let mut updated = None;
+            let mut remove = None;
+            let mut learn_input = None;
+            let mut learn_key = None;
+            for (index, mapping) in profile.keyboard.iter().enumerate() {
+                let mut next = mapping.clone();
+                egui::Frame::new()
+                    .fill(SURFACE_MUTED)
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(format!("{}.", index + 1)).strong());
+                            let input = if self.learning_keyboard_input == Some(index) {
+                                "нажмите кнопку…".to_owned()
+                            } else {
+                                next.input.label()
+                            };
+                            let active = mapper::input_pressed(next.input, &self.runtime.raw_state);
+                            let input = if active {
+                                RichText::new(input).strong().color(SUCCESS)
+                            } else {
+                                RichText::new(input)
+                            };
+                            if ui
+                                .button(input)
+                                .on_hover_text("Назначить кнопку контроллера")
+                                .clicked()
+                            {
+                                learn_input = Some(index);
+                            }
+                            egui::ComboBox::from_id_salt(("key-layer", index))
+                                .selected_text(Self::layer_name(next.modifier))
+                                .show_ui(ui, |ui| {
+                                    for layer in &layers {
+                                        ui.selectable_value(
+                                            &mut next.modifier,
+                                            *layer,
+                                            Self::layer_name(*layer),
+                                        );
+                                    }
+                                });
+                            egui::ComboBox::from_id_salt(("key-trigger", index))
+                                .selected_text(next.trigger.label())
+                                .show_ui(ui, |ui| {
+                                    for trigger in TriggerType::ALL {
+                                        ui.selectable_value(
+                                            &mut next.trigger,
+                                            trigger,
+                                            trigger.label(),
+                                        );
+                                    }
+                                });
+                            if ui.button("×").on_hover_text("Удалить назначение").clicked()
+                            {
+                                remove = Some(index);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Клавиша:");
+                            let key = if self.learning_key == Some(index) {
+                                "нажмите клавишу…".to_owned()
+                            } else {
+                                next.key.label()
+                            };
+                            if ui.button(key).on_hover_text("Захват клавиши").clicked()
+                            {
+                                learn_key = Some(index);
+                            }
+                            egui::ComboBox::from_id_salt(("key-list", index))
+                                .selected_text("Список")
+                                .height(320.0)
+                                .show_ui(ui, |ui| {
+                                    for (vk, name) in KEYS {
+                                        ui.selectable_value(&mut next.key.vk, *vk, *name);
+                                    }
+                                });
+                            ui.checkbox(&mut next.key.ctrl, "Ctrl");
+                            ui.checkbox(&mut next.key.shift, "Shift");
+                            ui.checkbox(&mut next.key.alt, "Alt");
+                            ui.checkbox(&mut next.key.win, "Win");
+                            egui::ComboBox::from_id_salt(("key-mode", index))
+                                .selected_text(press_mode_label(next.key.mode))
+                                .show_ui(ui, |ui| {
+                                    for mode in [PressMode::HoldWhilePressed, PressMode::Pulse] {
+                                        ui.selectable_value(
+                                            &mut next.key.mode,
+                                            mode,
+                                            press_mode_label(mode),
+                                        );
+                                    }
+                                });
+                        });
+                    });
+                ui.add_space(4.0);
+                if next != *mapping {
+                    updated = Some((index, next));
+                }
+            }
+
+            if let Some((index, mapping)) = updated {
+                self.current_profile_mut().keyboard[index] = mapping;
+                self.profile_changed();
+            }
+            if let Some(index) = remove {
+                self.current_profile_mut().keyboard.remove(index);
+                self.cancel_learning();
+                self.status = format!("Клавиатурное назначение {} удалено.", index + 1);
+                self.profile_changed();
+            }
+            if let Some(index) = learn_input {
+                self.begin_learning_input(None, Some(index));
+            }
+            if let Some(index) = learn_key {
+                self.begin_learning_key(index);
+            }
+            if ui.button("+ Добавить клавишу").clicked() {
+                let layer = self.edit_layer;
+                let index = {
+                    let profile = self.current_profile_mut();
+                    profile.keyboard.push(KeyboardMapping {
+                        modifier: layer,
+                        key: KeyOutput::default(),
+                        ..Default::default()
+                    });
+                    profile.keyboard.len() - 1
+                };
+                self.profile_changed();
+                self.begin_learning_input(None, Some(index));
+            }
+        });
+    }
+
     fn render_raw_inputs(&mut self, ui: &mut egui::Ui) {
         surface(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Live physical input").strong());
+                ui.label(RichText::new("Физический ввод в реальном времени").strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
                         RichText::new(primary_live_input_label(&self.runtime.raw_state))
@@ -1271,37 +1842,43 @@ impl X360ceApp {
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
         surface(ui, |ui| {
-            ui.label(RichText::new("Settings and updates").strong());
+            ui.label(RichText::new("Настройки и обновления").strong());
             ui.add_space(6.0);
 
             let mut changed = false;
             ui.columns(2, |columns| {
                 changed |= columns[0]
-                    .checkbox(&mut self.state.auto_tray_enabled, "Auto tray")
+                    .checkbox(&mut self.state.auto_tray_enabled, "Авто-трей")
                     .changed();
                 changed |= columns[0]
-                    .checkbox(&mut self.state.start_in_tray, "Start in tray")
+                    .checkbox(&mut self.state.start_in_tray, "Запуск в трее")
                     .changed();
                 changed |= columns[0]
-                    .checkbox(&mut self.state.forward_only_in_tray, "Forward only in tray")
+                    .checkbox(
+                        &mut self.state.forward_only_in_tray,
+                        "Работать только в трее",
+                    )
                     .changed();
                 self.state.block_game_bar_controller_button = true;
                 columns[1].add_enabled(
                     false,
                     egui::Checkbox::new(
                         &mut self.state.block_game_bar_controller_button,
-                        "Windows Game Bar blocked",
+                        "Xbox Game Bar заблокирован",
                     ),
                 );
                 changed |= columns[1]
-                    .checkbox(&mut self.state.include_prereleases, "Prereleases")
+                    .checkbox(
+                        &mut self.state.include_prereleases,
+                        "Предварительные версии",
+                    )
                     .changed();
             });
 
             if changed {
                 self.sync_forwarding_mode();
                 if let Err(error) = game_bar::install_hard_block() {
-                    self.status = format!("Xbox Game Bar shortcut update failed: {error}");
+                    self.status = format!("Не удалось обновить блокировку Xbox Game Bar: {error}");
                 }
                 self.mark_activity();
                 self.save();
@@ -1314,9 +1891,9 @@ impl X360ceApp {
                     .add_enabled(
                         !config::is_dev_build(),
                         egui::Button::new(if self.state.startup_enabled {
-                            "Disable startup"
+                            "Выключить автозапуск"
                         } else {
-                            "Enable startup"
+                            "Включить автозапуск"
                         }),
                     )
                     .clicked()
@@ -1326,7 +1903,7 @@ impl X360ceApp {
                 if ui
                     .add_enabled(
                         !config::is_dev_build() && self.update_rx.is_none(),
-                        egui::Button::new("Check updates"),
+                        egui::Button::new("Проверить обновления"),
                     )
                     .clicked()
                 {
@@ -1341,15 +1918,15 @@ impl X360ceApp {
                                 check.is_update_available && check.asset_download_url.is_some()
                             })
                             .unwrap_or(false),
-                        egui::Button::new("Install update"),
+                        egui::Button::new("Установить обновление"),
                     )
                     .clicked()
                 {
                     self.install_update();
                 }
-                if ui.button("Open releases").clicked() {
+                if ui.button("Страница релизов").clicked() {
                     if let Err(error) = updater::open_releases_page() {
-                        self.status = format!("Could not open releases: {error}");
+                        self.status = format!("Не удалось открыть страницу релизов: {error}");
                     }
                 }
             });
@@ -1357,7 +1934,7 @@ impl X360ceApp {
             ui.add_space(5.0);
             if config::is_dev_build() {
                 ui.label(
-                    RichText::new("Update checks disabled in dev builds.")
+                    RichText::new("Проверка обновлений отключена в сборке для разработки.")
                         .size(11.0)
                         .color(MUTED),
                 );
@@ -1365,11 +1942,63 @@ impl X360ceApp {
                 ui.label(RichText::new(update_status(check)).size(11.0).color(MUTED));
             } else {
                 ui.label(
-                    RichText::new("No update check yet.")
+                    RichText::new("Обновления ещё не проверялись.")
                         .size(11.0)
                         .color(MUTED),
                 );
             }
+
+            ui.add_space(10.0);
+            ui.label(RichText::new("Игровые устройства (joy.cpl)").strong());
+            ui.label(
+                RichText::new(
+                    "Некоторые рули и джойстики отдают часть кнопок, только пока открыты их \
+                     «Свойства». Окно открывается за краем экрана и закрывается при выходе.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
+            let mut joy_changed = ui
+                .checkbox(
+                    &mut self.state.joycpl_on_start,
+                    "Открывать свойства устройства при запуске",
+                )
+                .changed();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Имя в joy.cpl").size(11.0).color(MUTED));
+                joy_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.state.joycpl_device_name)
+                            .hint_text("пусто — выбранный контроллер")
+                            .desired_width(240.0),
+                    )
+                    .changed();
+            });
+            if joy_changed {
+                self.save();
+                self.mark_activity();
+            }
+            ui.horizontal_wrapped(|ui| {
+                let open_label = if self.joycpl_rx.is_some() {
+                    "Открываю…"
+                } else if self.joycpl_pid.is_some() {
+                    "Открыть заново"
+                } else {
+                    "Открыть свойства (за экраном)"
+                };
+                if ui
+                    .add_enabled(self.joycpl_rx.is_none(), egui::Button::new(open_label))
+                    .clicked()
+                {
+                    self.start_joycpl();
+                }
+                if ui
+                    .add_enabled(self.joycpl_pid.is_some(), egui::Button::new("Закрыть"))
+                    .clicked()
+                {
+                    self.close_joycpl();
+                }
+            });
         });
     }
 }
@@ -1488,23 +2117,28 @@ fn draw_controller_body(ui: &egui::Ui, rect: egui::Rect) {
     }
 }
 
+/// Ширина / высота картинки `controller-layout.png`.
+const CONTROLLER_IMAGE_ASPECT: f32 = 506.0 / 333.0;
+
+/// Точки на картинке DualShock 4 (доли ширины/высоты картинки; триггеры — над ней).
+/// Подписи остаются Xbox: A — крест, B — круг, X — квадрат, Y — треугольник.
 fn controller_points() -> [(OutputControl, f32, f32); 15] {
     [
-        (OutputControl::LeftTrigger, 0.26, 0.09),
-        (OutputControl::RightTrigger, 0.74, 0.09),
-        (OutputControl::LeftShoulder, 0.33, 0.14),
-        (OutputControl::RightShoulder, 0.67, 0.14),
-        (OutputControl::Guide, 0.50, 0.29),
-        (OutputControl::Back, 0.42, 0.34),
-        (OutputControl::Start, 0.58, 0.34),
-        (OutputControl::Y, 0.763, 0.212),
-        (OutputControl::B, 0.836, 0.313),
-        (OutputControl::A, 0.763, 0.417),
-        (OutputControl::X, 0.686, 0.323),
-        (OutputControl::DpadUp, 0.22, 0.23),
-        (OutputControl::DpadRight, 0.29, 0.31),
-        (OutputControl::DpadDown, 0.22, 0.39),
-        (OutputControl::DpadLeft, 0.15, 0.31),
+        (OutputControl::LeftTrigger, 0.217, -0.11),
+        (OutputControl::RightTrigger, 0.783, -0.11),
+        (OutputControl::LeftShoulder, 0.217, 0.03),
+        (OutputControl::RightShoulder, 0.783, 0.03),
+        (OutputControl::Guide, 0.498, 0.495),
+        (OutputControl::Back, 0.306, 0.12),
+        (OutputControl::Start, 0.709, 0.12),
+        (OutputControl::Y, 0.814, 0.165),
+        (OutputControl::B, 0.887, 0.279),
+        (OutputControl::A, 0.814, 0.384),
+        (OutputControl::X, 0.743, 0.276),
+        (OutputControl::DpadUp, 0.194, 0.204),
+        (OutputControl::DpadRight, 0.253, 0.279),
+        (OutputControl::DpadDown, 0.194, 0.360),
+        (OutputControl::DpadLeft, 0.134, 0.279),
     ]
 }
 
@@ -1572,6 +2206,10 @@ fn ui_root(app: &mut X360ceApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                         let (left, right) = columns.split_at_mut(1);
                         left[0].vertical(|ui| {
                             app.render_controller(ui);
+                            ui.add_space(8.0);
+                            app.render_layers(ui);
+                            ui.add_space(8.0);
+                            app.render_keyboard(ui);
                             ui.add_space(8.0);
                             app.render_raw_inputs(ui);
                         });
@@ -1677,6 +2315,8 @@ fn controller_control(
         .map(|entry| control_preview_active(control, entry, &app.runtime.raw_state))
         .unwrap_or(false);
     let selected = app.learning_control == Some(control) && app.selected_axis_negative.is_none();
+    // В слое модификатора пустые назначения — норма, не подсвечиваем их.
+    let mapped = mapped || app.edit_layer.is_some();
     let fill = if active {
         Color32::from_rgb(55, 184, 105)
     } else if selected {
@@ -1747,7 +2387,7 @@ fn controller_control(
     response.on_hover_text(format!(
         "{}
 {}
-Double-click to learn",
+Двойной щелчок — назначить",
         control.label(),
         entry_label_for(profile, control)
     ));
@@ -1894,13 +2534,13 @@ fn draw_stick_controls(
             if active { 2.1 } else { 1.7 },
         );
         response.on_hover_text(format!(
-            "{} {} output
-Double-click to learn",
+            "{} — {} направление
+Двойной щелчок — назначить",
             control.label(),
             if output_negative {
-                "negative"
+                "отрицательное"
             } else {
-                "positive"
+                "положительное"
             }
         ));
     }
@@ -1912,16 +2552,16 @@ fn compact_control_label(control: OutputControl) -> &'static str {
         OutputControl::RightShoulder => "RB",
         OutputControl::LeftThumb => "L3",
         OutputControl::RightThumb => "R3",
-        OutputControl::DpadUp => "D-pad Up",
-        OutputControl::DpadRight => "D-pad Right",
-        OutputControl::DpadDown => "D-pad Down",
-        OutputControl::DpadLeft => "D-pad Left",
+        OutputControl::DpadUp => "Крестовина вверх",
+        OutputControl::DpadRight => "Крестовина вправо",
+        OutputControl::DpadDown => "Крестовина вниз",
+        OutputControl::DpadLeft => "Крестовина влево",
         OutputControl::LeftTrigger => "LT",
         OutputControl::RightTrigger => "RT",
-        OutputControl::LeftStickX => "Left X",
-        OutputControl::LeftStickY => "Left Y",
-        OutputControl::RightStickX => "Right X",
-        OutputControl::RightStickY => "Right Y",
+        OutputControl::LeftStickX => "Левый X",
+        OutputControl::LeftStickY => "Левый Y",
+        OutputControl::RightStickX => "Правый X",
+        OutputControl::RightStickY => "Правый Y",
         _ => control.label(),
     }
 }
@@ -1959,24 +2599,24 @@ fn control_preview_active(
 fn primary_live_input_label(raw: &RawState) -> String {
     for (index, pressed) in raw.buttons.iter().enumerate() {
         if *pressed {
-            return format!("Button {}", index + 1);
+            return format!("Кнопка {}", index + 1);
         }
     }
     for (index, value) in raw.axes.iter().enumerate() {
         let normalized = normalize_axis(*value);
         if normalized >= 0.18 {
-            return format!("Axis {} +", index + 1);
+            return format!("Ось {} +", index + 1);
         }
         if normalized <= -0.18 {
-            return format!("Axis {} -", index + 1);
+            return format!("Ось {} -", index + 1);
         }
     }
     for (index, hat) in raw.hats.iter().enumerate() {
         if *hat != crate::model::HatDirection::Centered {
-            return format!("Hat {} {}", index + 1, hat.label());
+            return format!("Хатка {} {}", index + 1, hat.label());
         }
     }
-    "none".to_owned()
+    "ничего".to_owned()
 }
 
 fn axis_binding_positive(binding: InputBinding) -> Option<bool> {
@@ -1988,7 +2628,7 @@ fn axis_binding_positive(binding: InputBinding) -> Option<bool> {
 }
 
 fn load_controller_texture(ctx: &egui::Context) -> Option<TextureHandle> {
-    let image = image::load_from_memory(include_bytes!("../assets/x360ce.png"))
+    let image = image::load_from_memory(include_bytes!("../assets/controller-layout.png"))
         .ok()?
         .into_rgba8();
     let (width, height) = image.dimensions();
@@ -2004,8 +2644,14 @@ fn load_controller_texture(ctx: &egui::Context) -> Option<TextureHandle> {
 fn entry_label_for(profile: &ControllerProfile, control: OutputControl) -> String {
     profile
         .entry(control)
-        .map(|entry| entry.binding.label())
-        .unwrap_or_else(|| "Not mapped".to_owned())
+        .map(|entry| {
+            if entry.trigger == TriggerType::Direct || entry.binding == InputBinding::None {
+                entry.binding.label()
+            } else {
+                format!("{} · {}", entry.binding.label(), entry.trigger.label())
+            }
+        })
+        .unwrap_or_else(|| "Не назначено".to_owned())
 }
 
 fn draw_embedded_logo(ui: &mut egui::Ui) {
@@ -2071,7 +2717,7 @@ fn draw_header_logo(ui: &mut egui::Ui) {
 
 fn load_window_icon(bytes: &[u8]) -> Result<egui::IconData> {
     let image = image::load_from_memory(bytes)
-        .context("failed to decode embedded window icon")?
+        .context("не удалось загрузить значок окна")?
         .into_rgba8();
     let (width, height) = image.dimensions();
     Ok(egui::IconData {
@@ -2083,11 +2729,11 @@ fn load_window_icon(bytes: &[u8]) -> Result<egui::IconData> {
 
 fn load_tray_image(bytes: &[u8]) -> Result<TrayImage> {
     let image = image::load_from_memory(bytes)
-        .context("failed to decode embedded tray icon")?
+        .context("не удалось загрузить значок трея")?
         .into_rgba8();
     let (width, height) = image.dimensions();
     TrayImage::from_rgba(image.into_raw(), width, height)
-        .map_err(|error| anyhow::anyhow!("invalid tray icon: {error}"))
+        .map_err(|error| anyhow::anyhow!("неверный значок трея: {error}"))
 }
 
 fn tray_tooltip(state: &SavedState, virtual_connected: bool) -> String {
@@ -2095,36 +2741,146 @@ fn tray_tooltip(state: &SavedState, virtual_connected: bool) -> String {
         "x360ce {} — {}",
         config::app_version_label(),
         if virtual_connected {
-            "forwarding"
+            "работает"
         } else if state.emulation_enabled {
-            "waiting for controller"
+            "ожидание контроллера"
         } else {
-            "paused"
+            "пауза"
         }
     )
 }
 
 fn update_status(check: &updater::UpdateCheck) -> String {
     let channel = if check.prerelease {
-        "prerelease"
+        "предварительная"
     } else {
-        "stable"
+        "стабильная"
     };
     if check.is_update_available {
         match &check.asset_name {
             Some(asset) => format!(
-                "Update available: v{} ({channel}, {asset}).",
+                "Доступно обновление: v{} ({channel}, {asset}).",
                 check.latest_version
             ),
             None => format!(
-                "Update available: v{} ({channel}), but no Windows asset was found.",
+                "Доступно обновление: v{} ({channel}), но файл для Windows не найден.",
                 check.latest_version
             ),
         }
     } else {
         format!(
-            "Current version is latest: v{} ({channel}).",
+            "Установлена последняя версия: v{} ({channel}).",
             check.current_version
         )
     }
+}
+
+fn press_mode_label(mode: PressMode) -> &'static str {
+    match mode {
+        PressMode::HoldWhilePressed => "Удерживать, пока зажата",
+        PressMode::Pulse => "Короткий импульс",
+    }
+}
+
+/// Клавиша egui → виртуальный код Windows.
+fn egui_key_to_vk(key: egui::Key) -> Option<u16> {
+    use egui::Key as K;
+    let letters = [
+        K::A,
+        K::B,
+        K::C,
+        K::D,
+        K::E,
+        K::F,
+        K::G,
+        K::H,
+        K::I,
+        K::J,
+        K::K,
+        K::L,
+        K::M,
+        K::N,
+        K::O,
+        K::P,
+        K::Q,
+        K::R,
+        K::S,
+        K::T,
+        K::U,
+        K::V,
+        K::W,
+        K::X,
+        K::Y,
+        K::Z,
+    ];
+    if let Some(index) = letters.iter().position(|item| *item == key) {
+        return Some(0x41 + index as u16);
+    }
+    let digits = [
+        K::Num0,
+        K::Num1,
+        K::Num2,
+        K::Num3,
+        K::Num4,
+        K::Num5,
+        K::Num6,
+        K::Num7,
+        K::Num8,
+        K::Num9,
+    ];
+    if let Some(index) = digits.iter().position(|item| *item == key) {
+        return Some(0x30 + index as u16);
+    }
+    let functions = [
+        K::F1,
+        K::F2,
+        K::F3,
+        K::F4,
+        K::F5,
+        K::F6,
+        K::F7,
+        K::F8,
+        K::F9,
+        K::F10,
+        K::F11,
+        K::F12,
+    ];
+    if let Some(index) = functions.iter().position(|item| *item == key) {
+        return Some(0x70 + index as u16);
+    }
+    Some(match key {
+        K::Space => 0x20,
+        K::Enter => 0x0D,
+        K::Escape => 0x1B,
+        K::Tab => 0x09,
+        K::Backspace => 0x08,
+        K::ArrowUp => 0x26,
+        K::ArrowDown => 0x28,
+        K::ArrowLeft => 0x25,
+        K::ArrowRight => 0x27,
+        K::Insert => 0x2D,
+        K::Delete => 0x2E,
+        K::Home => 0x24,
+        K::End => 0x23,
+        K::PageUp => 0x21,
+        K::PageDown => 0x22,
+        K::ShiftLeft => 0xA0,
+        K::ShiftRight => 0xA1,
+        K::ControlLeft => 0xA2,
+        K::ControlRight => 0xA3,
+        K::AltLeft => 0xA4,
+        K::AltRight => 0xA5,
+        K::Minus => 0xBD,
+        K::Equals | K::Plus => 0xBB,
+        K::OpenBracket => 0xDB,
+        K::CloseBracket => 0xDD,
+        K::Semicolon => 0xBA,
+        K::Quote => 0xDE,
+        K::Comma => 0xBC,
+        K::Period => 0xBE,
+        K::Slash => 0xBF,
+        K::Backslash => 0xDC,
+        K::Backtick => 0xC0,
+        _ => return None,
+    })
 }

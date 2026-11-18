@@ -9,14 +9,14 @@ pub struct VirtualGamepad {
 
 impl VirtualGamepad {
     pub fn connect() -> Result<Self> {
-        let client = Client::connect().context("failed to connect to ViGEmBus")?;
+        let client = Client::connect().context("не удалось подключиться к ViGEmBus")?;
         let target = client
             .new_x360_target()
             .plugin()
-            .context("failed to plug virtual Xbox 360 controller")?;
+            .context("не удалось подключить виртуальный контроллер Xbox 360")?;
         target
             .wait_for_ready()
-            .context("virtual Xbox 360 controller did not become ready")?;
+            .context("виртуальный контроллер Xbox 360 не стал готов")?;
         Ok(Self {
             _client: client,
             target,
@@ -26,6 +26,6 @@ impl VirtualGamepad {
     pub fn update(&self, report: &X360Report) -> Result<()> {
         self.target
             .update(report)
-            .context("failed to update virtual Xbox 360 controller")
+            .context("не удалось обновить виртуальный контроллер Xbox 360")
     }
 }

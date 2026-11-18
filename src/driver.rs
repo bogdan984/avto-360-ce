@@ -57,7 +57,7 @@ pub fn launch_installer_elevated() -> Result<PathBuf> {
 
     if result <= 32 {
         anyhow::bail!(
-            "failed to launch ViGEmBus installer with elevation (ShellExecuteW code {result})"
+            "не удалось запустить установщик ViGEmBus с правами администратора (код ShellExecuteW {result})"
         );
     }
 
@@ -68,12 +68,16 @@ fn extract_installer() -> Result<PathBuf> {
     let base = env::temp_dir()
         .join("x360ce")
         .join(format!("driver-{}", process::id()));
-    fs::create_dir_all(&base)
-        .with_context(|| format!("failed to create driver temp folder: {}", base.display()))?;
+    fs::create_dir_all(&base).with_context(|| {
+        format!(
+            "не удалось создать временную папку драйвера: {}",
+            base.display()
+        )
+    })?;
     let path = base.join(INSTALLER_FILE_NAME);
     fs::write(&path, INSTALLER_BYTES).with_context(|| {
         format!(
-            "failed to extract embedded driver installer: {}",
+            "не удалось извлечь встроенный установщик драйвера: {}",
             path.display()
         )
     })?;

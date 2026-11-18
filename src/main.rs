@@ -1,4 +1,4 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod config;
 mod model;
@@ -10,6 +10,10 @@ mod driver;
 mod engine;
 #[cfg(windows)]
 mod game_bar;
+#[cfg(windows)]
+mod joycpl;
+#[cfg(windows)]
+mod keyboard_output;
 #[cfg(windows)]
 mod mapper;
 #[cfg(windows)]
@@ -45,5 +49,5 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("x360ce is a Windows-only controller mapper.");
+    eprintln!("x360ce работает только в Windows.");
 }

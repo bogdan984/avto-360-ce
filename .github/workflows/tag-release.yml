@@ -1,0 +1,54 @@
+name: Tag release
+
+# Пуш тега вида v0.2.0 собирает x360ce.exe под Windows x64 и публикует релиз.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    env:
+      RUST_TARGET: x86_64-pc-windows-msvc
+      CARGO_TERM_COLOR: always
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+
+      - name: Check tag matches Cargo version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$Version" -ne "${{ github.ref_name }}") {
+              Write-Error "Tag ${{ github.ref_name }} does not match Cargo.toml version $Version"
+              exit 1
+          }
+
+      - name: Run tests
+        run: cargo test --release --target ${{ env.RUST_TARGET }} --bin x360ce
+
+      - name: Build executable
+        run: cargo build --release --target ${{ env.RUST_TARGET }} --bin x360ce
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Asset = "x360ce-${{ github.ref_name }}-windows-x64.exe"
+          Copy-Item "target/${{ env.RUST_TARGET }}/release/x360ce.exe" $Asset
+          gh release create "${{ github.ref_name }}" $Asset `
+              --repo "${{ github.repository }}" `
+              --title "x360ce ${{ github.ref_name }}" `
+              --notes-file RELEASE_NOTES.md

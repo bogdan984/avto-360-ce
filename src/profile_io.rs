@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::{fs, os::windows::process::CommandExt, path::PathBuf, process::Command};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const FILTER: &str =
-    "x360ce mapping (*.json)|*.json|JSON files (*.json)|*.json|All files (*.*)|*.*";
+    "Назначения x360ce (*.json)|*.json|Файлы JSON (*.json)|*.json|Все файлы (*.*)|*.*";
 
 pub fn export_profile(profile: &ControllerProfile) -> Result<Option<PathBuf>> {
     let default_name = format!("{}.x360ce.json", sanitize_filename(&profile.name));
@@ -12,10 +12,10 @@ pub fn export_profile(profile: &ControllerProfile) -> Result<Option<PathBuf>> {
     };
 
     let mut serialized =
-        serde_json::to_vec_pretty(profile).context("failed to serialize controller mapping")?;
+        serde_json::to_vec_pretty(profile).context("не удалось сохранить назначения в JSON")?;
     serialized.push(b'\n');
     fs::write(&path, serialized)
-        .with_context(|| format!("failed to export mapping: {}", path.display()))?;
+        .with_context(|| format!("не удалось экспортировать назначения: {}", path.display()))?;
     Ok(Some(path))
 }
 
@@ -24,10 +24,10 @@ pub fn import_profile() -> Result<Option<(PathBuf, ControllerProfile)>> {
         return Ok(None);
     };
 
-    let bytes =
-        fs::read(&path).with_context(|| format!("failed to read mapping: {}", path.display()))?;
+    let bytes = fs::read(&path)
+        .with_context(|| format!("не удалось прочитать файл назначений: {}", path.display()))?;
     let profile: ControllerProfile = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid x360ce mapping: {}", path.display()))?;
+        .with_context(|| format!("неверный файл назначений x360ce: {}", path.display()))?;
     Ok(Some((path, profile)))
 }
 
@@ -74,12 +74,12 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {{
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .context("failed to open Windows mapping file dialog")?;
+        .context("не удалось открыть окно выбора файла")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         anyhow::bail!(
-            "mapping file dialog failed{}",
+            "ошибка окна выбора файла{}",
             if stderr.is_empty() {
                 String::new()
             } else {

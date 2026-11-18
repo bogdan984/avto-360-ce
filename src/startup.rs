@@ -33,7 +33,7 @@ pub fn is_enabled() -> Result<bool> {
     } else if status == ERROR_FILE_NOT_FOUND {
         Ok(false)
     } else {
-        anyhow::bail!("failed to query Windows startup value: {status}")
+        anyhow::bail!("не удалось прочитать параметр автозапуска Windows: {status}")
     }
 }
 
@@ -66,7 +66,7 @@ fn enable() -> Result<()> {
     };
 
     if status != ERROR_SUCCESS {
-        anyhow::bail!("failed to write Windows startup value: {status}");
+        anyhow::bail!("не удалось записать параметр автозапуска Windows: {status}");
     }
 
     Ok(())
@@ -80,12 +80,12 @@ fn disable() -> Result<()> {
     if status == ERROR_SUCCESS || status == ERROR_FILE_NOT_FOUND {
         Ok(())
     } else {
-        anyhow::bail!("failed to delete Windows startup value: {status}")
+        anyhow::bail!("не удалось удалить параметр автозапуска Windows: {status}")
     }
 }
 
 fn startup_command() -> Result<Vec<u16>> {
-    let exe = env::current_exe().context("failed to resolve current executable path")?;
+    let exe = env::current_exe().context("не удалось определить путь к программе")?;
     let command = format!("\"{}\" --startup", exe.display());
     Ok(wide_null(command))
 }
@@ -95,7 +95,7 @@ fn open_run_key(access: u32) -> Result<RegKey> {
     let mut raw: HKEY = ptr::null_mut();
     let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, access, &mut raw) };
     if status != ERROR_SUCCESS {
-        anyhow::bail!("failed to open Windows startup registry key: {status}");
+        anyhow::bail!("не удалось открыть раздел автозапуска в реестре: {status}");
     }
     Ok(RegKey { raw })
 }
@@ -117,7 +117,7 @@ fn create_run_key() -> Result<RegKey> {
         )
     };
     if status != ERROR_SUCCESS {
-        anyhow::bail!("failed to create Windows startup registry key: {status}");
+        anyhow::bail!("не удалось создать раздел автозапуска в реестре: {status}");
     }
     Ok(RegKey { raw })
 }

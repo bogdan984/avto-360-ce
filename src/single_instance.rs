@@ -112,7 +112,7 @@ pub fn show_already_running_notice(existing_build: BuildKind) {
     let current_build = BuildKind::current();
     let message = already_running_message(existing_build, current_build);
     let message = str_wide_null(message);
-    let title = str_wide_null("x360ce is already running");
+    let title = str_wide_null("x360ce уже запущен");
 
     unsafe {
         MessageBoxW(
@@ -131,7 +131,7 @@ fn create_named_mutex(name: &str) -> Result<(HANDLE, bool)> {
     }
     let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if handle.is_null() {
-        anyhow::bail!("failed to create a x360ce single-instance mutex");
+        anyhow::bail!("не удалось создать мьютекс единственного экземпляра x360ce");
     }
 
     let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
@@ -175,19 +175,19 @@ fn build_window_exists(build_kind: BuildKind) -> bool {
 fn already_running_message(existing_build: BuildKind, current_build: BuildKind) -> &'static str {
     match (existing_build, current_build) {
         (BuildKind::Development, BuildKind::Production) => {
-            "A x360ce development build is already running.\n\nRight-click the x360ce tray icon and choose \"Quit x360ce\" before starting the production build."
+            "Уже запущена сборка x360ce для разработки.\n\nЩёлкните правой кнопкой по значку x360ce в трее и выберите «Выйти из x360ce», прежде чем запускать рабочую сборку."
         }
         (BuildKind::Production, BuildKind::Development) => {
-            "A x360ce production build is already running.\n\nRight-click the x360ce tray icon and choose \"Quit x360ce\" before starting the development build."
+            "Уже запущена рабочая сборка x360ce.\n\nЩёлкните правой кнопкой по значку x360ce в трее и выберите «Выйти из x360ce», прежде чем запускать сборку для разработки."
         }
         (BuildKind::Development, BuildKind::Development) => {
-            "x360ce development build is already running.\n\nRight-click the x360ce tray icon and choose \"Quit x360ce\" before starting it again."
+            "Сборка x360ce для разработки уже запущена.\n\nЩёлкните правой кнопкой по значку x360ce в трее и выберите «Выйти из x360ce», прежде чем запускать её снова."
         }
         (BuildKind::Production, BuildKind::Production) => {
-            "x360ce is already running.\n\nRight-click the x360ce tray icon and choose \"Quit x360ce\" before starting it again."
+            "x360ce уже запущен.\n\nЩёлкните правой кнопкой по значку x360ce в трее и выберите «Выйти из x360ce», прежде чем запускать его снова."
         }
         _ => {
-            "Another x360ce instance is already running.\n\nRight-click the x360ce tray icon and choose \"Quit x360ce\" before starting this build."
+            "Уже запущен другой экземпляр x360ce.\n\nЩёлкните правой кнопкой по значку x360ce в трее и выберите «Выйти из x360ce», прежде чем запускать эту сборку."
         }
     }
 }
@@ -200,17 +200,17 @@ mod tests {
     fn explains_development_to_production_conflict() {
         let message = already_running_message(BuildKind::Development, BuildKind::Production);
 
-        assert!(message.contains("development build is already running"));
-        assert!(message.contains("production build"));
-        assert!(message.contains("Quit x360ce"));
+        assert!(message.contains("сборка x360ce для разработки"));
+        assert!(message.contains("рабочую сборку"));
+        assert!(message.contains("Выйти из x360ce"));
     }
 
     #[test]
     fn explains_production_to_development_conflict() {
         let message = already_running_message(BuildKind::Production, BuildKind::Development);
 
-        assert!(message.contains("production build is already running"));
-        assert!(message.contains("development build"));
-        assert!(message.contains("Quit x360ce"));
+        assert!(message.contains("рабочая сборка x360ce"));
+        assert!(message.contains("сборку для разработки"));
+        assert!(message.contains("Выйти из x360ce"));
     }
 }

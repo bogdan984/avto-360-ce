@@ -42,6 +42,12 @@ pub struct SavedState {
     pub last_auto_update_check_unix_seconds: u64,
     #[serde(default)]
     pub last_status: String,
+    /// Открывать «Свойства» устройства в joy.cpl (за краем экрана) при запуске.
+    #[serde(default)]
+    pub joycpl_on_start: bool,
+    /// Имя устройства в списке joy.cpl; пусто — выбранный контроллер.
+    #[serde(default)]
+    pub joycpl_device_name: String,
 }
 
 impl Default for SavedState {
@@ -59,7 +65,9 @@ impl Default for SavedState {
             forward_only_in_tray: true,
             block_game_bar_controller_button: true,
             last_auto_update_check_unix_seconds: 0,
-            last_status: "Ready.".to_owned(),
+            last_status: "Готово.".to_owned(),
+            joycpl_on_start: false,
+            joycpl_device_name: String::new(),
         }
     }
 }
@@ -102,10 +110,10 @@ pub fn app_data_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
 
-    let current_exe = env::current_exe().context("failed to resolve current executable path")?;
+    let current_exe = env::current_exe().context("не удалось определить путь к программе")?;
     let exe_dir = current_exe
         .parent()
-        .context("failed to resolve current executable folder")?;
+        .context("не удалось определить папку программы")?;
     Ok(exe_dir.join(DATA_DIR_NAME))
 }
 
@@ -132,25 +140,35 @@ pub fn load_state() -> SavedState {
 
 fn read_state_from_path(path: &Path) -> Result<SavedState> {
     let contents = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+        .with_context(|| format!("не удалось прочитать файл настроек: {}", path.display()))?;
     serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse config file: {}", path.display()))
+        .with_context(|| format!("не удалось разобрать файл настроек: {}", path.display()))
 }
 
 pub fn save_state(state: &SavedState) -> Result<()> {
     let path = state_path()?;
-    let parent = path.parent().context("failed to resolve config folder")?;
+    let parent = path
+        .parent()
+        .context("не удалось определить папку настроек")?;
     fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create data folder: {}", parent.display()))?;
+        .with_context(|| format!("не удалось создать папку данных: {}", parent.display()))?;
 
     let temp = parent.join("config.json.tmp");
     let backup = parent.join(BACKUP_FILE_NAME);
     let serialized = serde_json::to_vec_pretty(state)?;
 
-    let mut file = fs::File::create(&temp)
-        .with_context(|| format!("failed to create temporary config file: {}", temp.display()))?;
-    file.write_all(&serialized)
-        .with_context(|| format!("failed to write temporary config file: {}", temp.display()))?;
+    let mut file = fs::File::create(&temp).with_context(|| {
+        format!(
+            "не удалось создать временный файл настроек: {}",
+            temp.display()
+        )
+    })?;
+    file.write_all(&serialized).with_context(|| {
+        format!(
+            "не удалось записать временный файл настроек: {}",
+            temp.display()
+        )
+    })?;
     file.write_all(b"\n")?;
     file.sync_all().ok();
     drop(file);
@@ -162,7 +180,7 @@ fn replace_config_file(temp: &Path, path: &Path, backup: &Path) -> Result<()> {
     if !path.exists() {
         return fs::rename(temp, path).with_context(|| {
             format!(
-                "failed to move config file: {} -> {}",
+                "не удалось переместить файл настроек: {} -> {}",
                 temp.display(),
                 path.display()
             )
@@ -174,7 +192,7 @@ fn replace_config_file(temp: &Path, path: &Path, backup: &Path) -> Result<()> {
     }
     fs::rename(path, backup).with_context(|| {
         format!(
-            "failed to create config backup: {} -> {}",
+            "не удалось создать резервную копию настроек: {} -> {}",
             path.display(),
             backup.display()
         )
@@ -189,7 +207,7 @@ fn replace_config_file(temp: &Path, path: &Path, backup: &Path) -> Result<()> {
             let _ = fs::rename(backup, path);
             Err(error).with_context(|| {
                 format!(
-                    "failed to replace config file: {} -> {}",
+                    "не удалось заменить файл настроек: {} -> {}",
                     temp.display(),
                     path.display()
                 )

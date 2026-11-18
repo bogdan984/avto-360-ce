@@ -13,7 +13,7 @@ pub fn install_hard_block() -> Result<()> {
     set_dword(GAME_DVR_KEY, "AppCaptureEnabled", 0)?;
     set_dword(GAME_DVR_STORE_KEY, "GameDVR_Enabled", 0)?;
 
-    let executable = env::current_exe().context("failed to resolve x360ce executable path")?;
+    let executable = env::current_exe().context("не удалось определить путь к x360ce")?;
     let executable = executable.to_string_lossy();
     let command = format!("\"{executable}\" --gamebar-noop");
 
@@ -63,10 +63,10 @@ where
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .status()
-        .context("failed to start Windows registry command")?;
+        .context("не удалось запустить команду реестра Windows")?;
 
     if !status.success() {
-        bail!("Windows registry command failed with exit code {status}");
+        bail!("команда реестра Windows завершилась с кодом {status}");
     }
 
     Ok(())

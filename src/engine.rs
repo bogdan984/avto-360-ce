@@ -1,5 +1,7 @@
 use crate::{
-    driver, mapper,
+    driver,
+    keyboard_output::KeyboardOutput,
+    mapper::MapperState,
     model::{ControllerProfile, DeviceDescriptor, HatDirection, RawState, RuntimeSnapshot},
     virtual_gamepad::VirtualGamepad,
 };
@@ -55,7 +57,8 @@ impl ControllerEngine {
                     forwarding_active,
                 ) {
                     update_snapshot(&worker_snapshot, |state| {
-                        state.last_error = Some(format!("controller engine stopped: {error:#}"));
+                        state.last_error =
+                            Some(format!("движок контроллера остановлен: {error:#}"));
                         state.virtual_connected = false;
                     });
                 }
@@ -110,6 +113,9 @@ fn run_worker(
     let mut devices = enumerate_devices(&joystick_subsystem);
     let mut joystick = open_selected(&joystick_subsystem, &devices, &selected_guid);
     let mut virtual_gamepad: Option<VirtualGamepad> = None;
+    let mut mapper_state = MapperState::default();
+    // Объявлена после SDL: при выходе из функции отпускает все клавиши.
+    let mut keyboard = KeyboardOutput::default();
     let mut previous_raw = RawState::default();
     let mut sequence = 0_u64;
     let mut last_enumeration = Instant::now();
@@ -125,6 +131,7 @@ fn run_worker(
                     selected_guid = guid;
                     joystick = open_selected(&joystick_subsystem, &devices, &selected_guid);
                     previous_raw = RawState::default();
+                    mapper_state.reset();
                     virtual_gamepad = None;
                     next_virtual_connect_attempt = Instant::now();
                     last_virtual_error = None;
@@ -143,7 +150,10 @@ fn run_worker(
                     last_virtual_error = None;
                 }
                 EngineCommand::Refresh => force_refresh = true,
-                EngineCommand::Shutdown => return Ok(()),
+                EngineCommand::Shutdown => {
+                    keyboard.release_all();
+                    return Ok(());
+                }
             }
         }
 
@@ -175,7 +185,23 @@ fn run_worker(
         if active {
             sequence = sequence.wrapping_add(1);
         }
-        if enabled && forwarding_active && joystick.is_some() && driver_installed {
+        let forwarding = enabled && forwarding_active && joystick.is_some();
+        let output = if forwarding {
+            Some(mapper_state.update(&profile, &raw, Instant::now()))
+        } else {
+            // Выключено, окно настройки открыто или нет контроллера:
+            // ничего не держим нажатым.
+            mapper_state.reset();
+            None
+        };
+        keyboard.sync(
+            output
+                .as_ref()
+                .map(|output| output.keys.as_slice())
+                .unwrap_or(&[]),
+        );
+
+        if let (Some(output), true) = (&output, driver_installed) {
             if virtual_gamepad.is_none() && Instant::now() >= next_virtual_connect_attempt {
                 match VirtualGamepad::connect() {
                     Ok(gamepad) => {
@@ -189,8 +215,7 @@ fn run_worker(
                 }
             }
             if let Some(gamepad) = &virtual_gamepad {
-                let report = mapper::map_report(&profile, &raw);
-                if let Err(error) = gamepad.update(&report) {
+                if let Err(error) = gamepad.update(&output.report) {
                     last_virtual_error = Some(error.to_string());
                     virtual_gamepad = None;
                     next_virtual_connect_attempt = Instant::now() + Duration::from_secs(2);
@@ -198,12 +223,11 @@ fn run_worker(
             }
         } else {
             virtual_gamepad = None;
-            last_virtual_error =
-                if enabled && forwarding_active && joystick.is_some() && !driver_installed {
-                    Some("ViGEmBus driver is not installed.".to_owned())
-                } else {
-                    None
-                };
+            last_virtual_error = if forwarding && !driver_installed {
+                Some("Драйвер ViGEmBus не установлен.".to_owned())
+            } else {
+                None
+            };
         }
         let last_error = last_virtual_error.clone();
 

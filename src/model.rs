@@ -28,15 +28,15 @@ pub enum HatDirection {
 impl HatDirection {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Centered => "Centered",
-            Self::Up => "Up",
-            Self::Right => "Right",
-            Self::Down => "Down",
-            Self::Left => "Left",
-            Self::RightUp => "Up + Right",
-            Self::RightDown => "Down + Right",
-            Self::LeftUp => "Up + Left",
-            Self::LeftDown => "Down + Left",
+            Self::Centered => "Центр",
+            Self::Up => "Вверх",
+            Self::Right => "Вправо",
+            Self::Down => "Вниз",
+            Self::Left => "Влево",
+            Self::RightUp => "Вверх + вправо",
+            Self::RightDown => "Вниз + вправо",
+            Self::LeftUp => "Вверх + влево",
+            Self::LeftDown => "Вниз + влево",
         }
     }
 
@@ -84,12 +84,12 @@ pub enum InputBinding {
 impl InputBinding {
     pub fn label(&self) -> String {
         match self {
-            Self::None => "Not mapped".to_owned(),
-            Self::Button { index } => format!("Button {}", index + 1),
-            Self::AxisPositive { index } => format!("Axis {} +", index + 1),
-            Self::AxisNegative { index } => format!("Axis {} -", index + 1),
+            Self::None => "Не назначено".to_owned(),
+            Self::Button { index } => format!("Кнопка {}", index + 1),
+            Self::AxisPositive { index } => format!("Ось {} +", index + 1),
+            Self::AxisNegative { index } => format!("Ось {} -", index + 1),
             Self::Hat { index, direction } => {
-                format!("Hat {} {}", index + 1, direction.label())
+                format!("Хатка {} {}", index + 1, direction.label())
             }
         }
     }
@@ -156,23 +156,23 @@ impl OutputControl {
             Self::B => "B",
             Self::X => "X",
             Self::Y => "Y",
-            Self::LeftShoulder => "Left shoulder",
-            Self::RightShoulder => "Right shoulder",
+            Self::LeftShoulder => "Левый бампер (LB)",
+            Self::RightShoulder => "Правый бампер (RB)",
             Self::Back => "Back",
             Self::Start => "Start",
             Self::Guide => "Guide",
-            Self::LeftThumb => "Left stick click",
-            Self::RightThumb => "Right stick click",
-            Self::DpadUp => "D-pad up",
-            Self::DpadRight => "D-pad right",
-            Self::DpadDown => "D-pad down",
-            Self::DpadLeft => "D-pad left",
-            Self::LeftTrigger => "Left trigger",
-            Self::RightTrigger => "Right trigger",
-            Self::LeftStickX => "Left stick X",
-            Self::LeftStickY => "Left stick Y",
-            Self::RightStickX => "Right stick X",
-            Self::RightStickY => "Right stick Y",
+            Self::LeftThumb => "Нажатие левого стика (L3)",
+            Self::RightThumb => "Нажатие правого стика (R3)",
+            Self::DpadUp => "Крестовина вверх",
+            Self::DpadRight => "Крестовина вправо",
+            Self::DpadDown => "Крестовина вниз",
+            Self::DpadLeft => "Крестовина влево",
+            Self::LeftTrigger => "Левый триггер (LT)",
+            Self::RightTrigger => "Правый триггер (RT)",
+            Self::LeftStickX => "Левый стик X",
+            Self::LeftStickY => "Левый стик Y",
+            Self::RightStickX => "Правый стик X",
+            Self::RightStickY => "Правый стик Y",
         }
     }
 
@@ -201,6 +201,196 @@ pub struct MappingEntry {
     pub deadzone: f32,
     #[serde(default = "default_saturation")]
     pub saturation: f32,
+    /// Тип нажатия; для стиков всегда используется Direct.
+    #[serde(default)]
+    pub trigger: TriggerType,
+}
+
+/// Как физическое нажатие превращается в действие.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TriggerType {
+    /// Мгновенно, пока кнопка зажата (поведение по умолчанию).
+    #[default]
+    Direct,
+    SingleTap,
+    DoubleTap,
+    LongPress,
+}
+
+impl TriggerType {
+    pub const ALL: [Self; 4] = [
+        Self::Direct,
+        Self::SingleTap,
+        Self::DoubleTap,
+        Self::LongPress,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "Прямое",
+            Self::SingleTap => "Одиночное",
+            Self::DoubleTap => "Двойное",
+            Self::LongPress => "Удержание",
+        }
+    }
+}
+
+/// Что делает сама кнопка-модификатор.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModifierMode {
+    /// Только переключает слой, своих действий нет.
+    #[default]
+    LayerOnly,
+    /// Переключает слой; если её нажали и отпустили без комбинации —
+    /// выполняет свои действия основного слоя коротким импульсом.
+    TapAction,
+    /// Переключает слой и одновременно работает как обычная кнопка.
+    Passthrough,
+}
+
+impl ModifierMode {
+    pub const ALL: [Self; 3] = [Self::LayerOnly, Self::TapAction, Self::Passthrough];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LayerOnly => "Только слой",
+            Self::TapAction => "Слой + своё действие при одиночном нажатии",
+            Self::Passthrough => "Слой + обычная кнопка",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModifierConfig {
+    #[serde(default)]
+    pub binding: InputBinding,
+    #[serde(default)]
+    pub mode: ModifierMode,
+    /// Назначения Xbox 360, действующие пока модификатор зажат.
+    #[serde(default)]
+    pub entries: Vec<MappingEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PressMode {
+    /// Клавиша зажата, пока зажата кнопка на контроллере.
+    #[default]
+    HoldWhilePressed,
+    /// Короткое нажатие и отпускание.
+    Pulse,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyOutput {
+    /// Виртуальный код клавиши Windows (VIRTUAL_KEY).
+    #[serde(default)]
+    pub vk: u16,
+    #[serde(default)]
+    pub ctrl: bool,
+    #[serde(default)]
+    pub shift: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub win: bool,
+    #[serde(default)]
+    pub mode: PressMode,
+}
+
+impl KeyOutput {
+    pub fn label(&self) -> String {
+        let mut parts = Vec::new();
+        for (on, name) in [
+            (self.ctrl, "Ctrl"),
+            (self.shift, "Shift"),
+            (self.alt, "Alt"),
+            (self.win, "Win"),
+        ] {
+            if on {
+                parts.push(name.to_owned());
+            }
+        }
+        parts.push(key_name(self.vk));
+        parts.join(" + ")
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct KeyboardMapping {
+    #[serde(default)]
+    pub input: InputBinding,
+    /// None — основной слой, Some(n) — слой модификатора n.
+    #[serde(default)]
+    pub modifier: Option<usize>,
+    #[serde(default)]
+    pub trigger: TriggerType,
+    #[serde(default)]
+    pub key: KeyOutput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timings {
+    #[serde(default = "default_double_tap_window_ms")]
+    pub double_tap_window_ms: u32,
+    #[serde(default = "default_hold_threshold_ms")]
+    pub hold_threshold_ms: u32,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Self {
+            double_tap_window_ms: default_double_tap_window_ms(),
+            hold_threshold_ms: default_hold_threshold_ms(),
+        }
+    }
+}
+
+fn default_double_tap_window_ms() -> u32 {
+    250
+}
+
+fn default_hold_threshold_ms() -> u32 {
+    350
+}
+
+/// Популярные клавиши для выпадающего списка: (VK, название).
+#[rustfmt::skip]
+pub const KEYS: &[(u16, &str)] = &[
+    (0x41, "A"), (0x42, "B"), (0x43, "C"), (0x44, "D"), (0x45, "E"), (0x46, "F"),
+    (0x47, "G"), (0x48, "H"), (0x49, "I"), (0x4A, "J"), (0x4B, "K"), (0x4C, "L"),
+    (0x4D, "M"), (0x4E, "N"), (0x4F, "O"), (0x50, "P"), (0x51, "Q"), (0x52, "R"),
+    (0x53, "S"), (0x54, "T"), (0x55, "U"), (0x56, "V"), (0x57, "W"), (0x58, "X"),
+    (0x59, "Y"), (0x5A, "Z"),
+    (0x30, "0"), (0x31, "1"), (0x32, "2"), (0x33, "3"), (0x34, "4"),
+    (0x35, "5"), (0x36, "6"), (0x37, "7"), (0x38, "8"), (0x39, "9"),
+    (0x70, "F1"), (0x71, "F2"), (0x72, "F3"), (0x73, "F4"), (0x74, "F5"), (0x75, "F6"),
+    (0x76, "F7"), (0x77, "F8"), (0x78, "F9"), (0x79, "F10"), (0x7A, "F11"), (0x7B, "F12"),
+    (0x20, "Пробел"), (0x0D, "Enter"), (0x1B, "Esc"), (0x09, "Tab"), (0x08, "Backspace"),
+    (0x26, "Стрелка вверх"), (0x28, "Стрелка вниз"), (0x25, "Стрелка влево"),
+    (0x27, "Стрелка вправо"),
+    (0x2D, "Insert"), (0x2E, "Delete"), (0x24, "Home"), (0x23, "End"),
+    (0x21, "Page Up"), (0x22, "Page Down"),
+    (0xA0, "Левый Shift"), (0xA2, "Левый Ctrl"), (0xA4, "Левый Alt"),
+    (0xA1, "Правый Shift"), (0xA3, "Правый Ctrl"), (0xA5, "Правый Alt"),
+    (0x14, "Caps Lock"),
+    (0x60, "Num 0"), (0x61, "Num 1"), (0x62, "Num 2"), (0x63, "Num 3"), (0x64, "Num 4"),
+    (0x65, "Num 5"), (0x66, "Num 6"), (0x67, "Num 7"), (0x68, "Num 8"), (0x69, "Num 9"),
+    (0x6A, "Num *"), (0x6B, "Num +"), (0x6D, "Num -"), (0x6E, "Num ."), (0x6F, "Num /"),
+    (0xBD, "-"), (0xBB, "="), (0xDB, "["), (0xDD, "]"), (0xBA, ";"), (0xDE, "'"),
+    (0xBC, ","), (0xBE, "."), (0xBF, "/"), (0xDC, "\\"), (0xC0, "`"),
+];
+
+pub fn key_name(vk: u16) -> String {
+    if vk == 0 {
+        return "Не выбрана".to_owned();
+    }
+    KEYS.iter()
+        .find(|(code, _)| *code == vk)
+        .map(|(_, name)| (*name).to_owned())
+        .unwrap_or_else(|| format!("VK 0x{vk:02X}"))
 }
 
 fn default_deadzone() -> f32 {
@@ -223,9 +413,13 @@ impl MappingEntry {
             centered_axis: false,
             deadzone: default_deadzone(),
             saturation: default_saturation(),
+            trigger: TriggerType::Direct,
         }
     }
 }
+
+/// Максимум кнопок-модификаторов (слоёв) в профиле.
+pub const MAX_MODIFIERS: usize = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControllerProfile {
@@ -233,6 +427,12 @@ pub struct ControllerProfile {
     pub device_guid: String,
     #[serde(default)]
     pub entries: Vec<MappingEntry>,
+    #[serde(default)]
+    pub modifiers: Vec<ModifierConfig>,
+    #[serde(default)]
+    pub keyboard: Vec<KeyboardMapping>,
+    #[serde(default)]
+    pub timings: Timings,
 }
 
 impl ControllerProfile {
@@ -313,9 +513,12 @@ impl ControllerProfile {
         ];
 
         Self {
-            name: "Default profile".to_owned(),
+            name: "Профиль по умолчанию".to_owned(),
             device_guid,
             entries,
+            modifiers: Vec::new(),
+            keyboard: Vec::new(),
+            timings: Timings::default(),
         }
     }
 
@@ -324,17 +527,45 @@ impl ControllerProfile {
     }
 
     pub fn entry_mut(&mut self, control: OutputControl) -> &mut MappingEntry {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.control == control)
-        {
-            return &mut self.entries[index];
-        }
-        self.entries
-            .push(MappingEntry::new(control, InputBinding::None));
-        self.entries.last_mut().expect("mapping entry was inserted")
+        entry_mut_in(&mut self.entries, control)
     }
+
+    /// Назначения Xbox слоя: None — основной, Some(n) — модификатор n.
+    pub fn layer_entries(&self, layer: Option<usize>) -> &[MappingEntry] {
+        match layer {
+            None => &self.entries,
+            Some(index) => self
+                .modifiers
+                .get(index)
+                .map(|modifier| modifier.entries.as_slice())
+                .unwrap_or(&[]),
+        }
+    }
+
+    /// Удаляет модификатор и сдвигает ссылки на последующие слои.
+    pub fn remove_modifier(&mut self, index: usize) {
+        if index >= self.modifiers.len() {
+            return;
+        }
+        self.modifiers.remove(index);
+        self.keyboard
+            .retain(|mapping| mapping.modifier != Some(index));
+        for mapping in &mut self.keyboard {
+            if let Some(layer) = mapping.modifier.as_mut() {
+                if *layer > index {
+                    *layer -= 1;
+                }
+            }
+        }
+    }
+}
+
+pub fn entry_mut_in(entries: &mut Vec<MappingEntry>, control: OutputControl) -> &mut MappingEntry {
+    if let Some(index) = entries.iter().position(|entry| entry.control == control) {
+        return &mut entries[index];
+    }
+    entries.push(MappingEntry::new(control, InputBinding::None));
+    entries.last_mut().expect("mapping entry was inserted")
 }
 
 #[derive(Clone, Debug, Default)]

@@ -8,9 +8,10 @@ use std::{
     process::Command,
 };
 
-const RELEASES_API: &str = "https://api.github.com/repos/rozsazoltan/x360ce/releases";
-const LATEST_RELEASE_API: &str = "https://api.github.com/repos/rozsazoltan/x360ce/releases/latest";
-const RELEASES_PAGE: &str = "https://github.com/rozsazoltan/x360ce/releases";
+const RELEASES_API: &str = "https://api.github.com/repos/bogdan984/avto-360-ce/releases";
+const LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/bogdan984/avto-360-ce/releases/latest";
+const RELEASES_PAGE: &str = "https://github.com/bogdan984/avto-360-ce/releases";
 const USER_AGENT: &str = "x360ce-Updater";
 
 #[derive(Clone, Debug)]
@@ -43,7 +44,7 @@ pub fn open_releases_page() -> Result<()> {
         Command::new("cmd.exe")
             .args(["/C", "start", "", RELEASES_PAGE])
             .spawn()
-            .context("failed to open GitHub releases page")?;
+            .context("не удалось открыть страницу релизов GitHub")?;
         Ok(())
     }
 
@@ -52,14 +53,14 @@ pub fn open_releases_page() -> Result<()> {
         Command::new("xdg-open")
             .arg(RELEASES_PAGE)
             .spawn()
-            .context("failed to open GitHub releases page")?;
+            .context("не удалось открыть страницу релизов GitHub")?;
         Ok(())
     }
 }
 
 fn ensure_updates_enabled() -> Result<()> {
     if cfg!(debug_assertions) {
-        anyhow::bail!("updates are disabled in development builds");
+        anyhow::bail!("обновления отключены в сборках для разработки");
     }
     Ok(())
 }
@@ -99,16 +100,16 @@ pub fn check_latest_prerelease() -> Result<UpdateCheck> {
         .into_iter()
         .next()
         .map(|(_, release)| release)
-        .context("no prerelease builds were found in GitHub releases")?;
+        .context("в релизах GitHub не найдено предварительных версий")?;
     update_check_from_release(release)
 }
 
 fn update_check_from_release(release: GitHubRelease) -> Result<UpdateCheck> {
     let current_version = env!("CARGO_PKG_VERSION").to_owned();
     let current_semver =
-        Version::parse(&current_version).context("invalid current application version")?;
+        Version::parse(&current_version).context("неверная текущая версия программы")?;
     let latest_semver = parse_release_version(&release.tag_name)
-        .context("invalid latest GitHub release version")?;
+        .context("неверная версия последнего релиза GitHub")?;
     let asset = release.assets.iter().find(|asset| {
         let name = asset.name.to_ascii_lowercase();
         name == "x360ce.exe"
@@ -128,14 +129,14 @@ fn update_check_from_release(release: GitHubRelease) -> Result<UpdateCheck> {
 
 fn parse_release_version(value: &str) -> Result<Version> {
     Version::parse(value.trim_start_matches('v'))
-        .with_context(|| format!("invalid release version: {value}"))
+        .with_context(|| format!("неверная версия релиза: {value}"))
 }
 
 fn http_client() -> Result<Client> {
     Client::builder()
         .user_agent(USER_AGENT)
         .build()
-        .context("failed to build HTTP client")
+        .context("не удалось создать HTTP-клиент")
 }
 
 fn get_github_json<T>(client: &Client, url: &str, label: &str) -> Result<T>
@@ -145,52 +146,56 @@ where
     let response = client
         .get(url)
         .send()
-        .with_context(|| format!("failed to contact {label}"))?;
+        .with_context(|| format!("не удалось связаться с {label}"))?;
     let status = response.status();
     if status == StatusCode::FORBIDDEN || status == StatusCode::TOO_MANY_REQUESTS {
         anyhow::bail!(
-            "GitHub temporarily refused the release check ({status}). Wait before checking again; repeated requests may trigger API rate limiting."
+            "GitHub временно отклонил проверку релизов ({status}). Подождите перед повторной проверкой: частые запросы могут привести к ограничению API."
         );
     }
     response
         .error_for_status()
-        .with_context(|| format!("{label} request failed"))?
+        .with_context(|| format!("запрос к {label} не удался"))?
         .json()
-        .with_context(|| format!("failed to parse {label} response"))
+        .with_context(|| format!("не удалось разобрать ответ {label}"))
 }
 
 pub fn install_update(check: &UpdateCheck) -> Result<()> {
     ensure_updates_enabled()?;
 
     let Some(download_url) = check.asset_download_url.as_ref() else {
-        anyhow::bail!("the selected release does not contain a Windows executable asset");
+        anyhow::bail!("в выбранном релизе нет исполняемого файла для Windows");
     };
 
-    let current_exe = env::current_exe().context("failed to resolve current executable path")?;
+    let current_exe = env::current_exe().context("не удалось определить путь к программе")?;
     ensure_current_exe_can_be_replaced(&current_exe)?;
 
     let update_dir = current_exe
         .parent()
         .map(|parent| parent.join(".x360ce-data").join("update"))
         .unwrap_or_else(|| env::temp_dir().join("x360ce-update"));
-    fs::create_dir_all(&update_dir)
-        .with_context(|| format!("failed to create update folder: {}", update_dir.display()))?;
+    fs::create_dir_all(&update_dir).with_context(|| {
+        format!(
+            "не удалось создать папку обновления: {}",
+            update_dir.display()
+        )
+    })?;
 
     let new_exe = update_dir.join("x360ce-update.exe");
 
     let bytes = http_client()?
         .get(download_url)
         .send()
-        .context("failed to download update asset")?
+        .context("не удалось скачать обновление")?
         .error_for_status()
-        .context("GitHub update asset download failed")?
+        .context("ошибка загрузки обновления с GitHub")?
         .bytes()
-        .context("failed to read downloaded update asset")?;
+        .context("не удалось прочитать скачанное обновление")?;
     if bytes.len() < 2 || &bytes[..2] != b"MZ" {
-        anyhow::bail!("downloaded update asset is not a Windows PE executable");
+        anyhow::bail!("скачанный файл не является программой Windows");
     }
     fs::write(&new_exe, &bytes)
-        .with_context(|| format!("failed to write update asset: {}", new_exe.display()))?;
+        .with_context(|| format!("не удалось записать обновление: {}", new_exe.display()))?;
 
     launch_windows_replacer(&current_exe, &new_exe)?;
     std::process::exit(0);
@@ -225,8 +230,12 @@ exit 1\r\n",
         new_exe = powershell_single_quoted_path(new_exe),
         current_exe = powershell_single_quoted_path(current_exe),
     );
-    fs::write(&script, script_contents)
-        .with_context(|| format!("failed to write updater script: {}", script.display()))?;
+    fs::write(&script, script_contents).with_context(|| {
+        format!(
+            "не удалось записать скрипт обновления: {}",
+            script.display()
+        )
+    })?;
 
     let script_path = script.to_string_lossy().to_string();
     Command::new("powershell.exe")
@@ -243,7 +252,7 @@ exit 1\r\n",
         ])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
-        .context("failed to launch hidden updater helper")?;
+        .context("не удалось запустить помощник обновления")?;
     Ok(())
 }
 
@@ -254,17 +263,17 @@ fn powershell_single_quoted_path(path: &Path) -> String {
 
 #[cfg(not(windows))]
 fn launch_windows_replacer(_current_exe: &Path, _new_exe: &Path) -> Result<()> {
-    anyhow::bail!("self-update replacement is currently implemented for Windows builds only")
+    anyhow::bail!("самообновление доступно только в Windows")
 }
 
 fn ensure_current_exe_can_be_replaced(current_exe: &Path) -> Result<()> {
     let Some(exe_dir) = current_exe.parent() else {
-        anyhow::bail!("could not resolve the executable folder for update replacement");
+        anyhow::bail!("не удалось определить папку программы для обновления");
     };
     let probe = exe_dir.join(".x360ce-update-write-test.tmp");
     fs::write(&probe, b"write-test").with_context(|| {
         format!(
-            "x360ce cannot update itself because the executable folder is not writable: {}. Move the app to a user-writable fixed folder or run the update with sufficient permissions.",
+            "x360ce не может обновиться: нет прав на запись в папку программы: {}. Перенесите программу в папку с правами записи или запустите обновление с достаточными правами.",
             exe_dir.display()
         )
     })?;
