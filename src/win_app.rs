@@ -19,9 +19,9 @@ use crate::{
     engine::{ControllerEngine, EngineCommand},
     game_bar, joycpl, mapper,
     model::{
-        entry_mut_in, key_name, ControllerProfile, InputBinding, KeyOutput, KeyboardMapping,
-        MappingEntry, ModifierConfig, ModifierMode, OutputControl, PaddleAxis, PressMode, RawState,
-        RuntimeSnapshot, TriggerType, KEYS, MAX_MODIFIERS,
+        entry_mut_in, key_name, same_device, ControllerProfile, InputBinding, KeyOutput,
+        KeyboardMapping, MappingEntry, ModifierConfig, ModifierMode, OutputControl, PaddleAxis,
+        PressMode, RawState, RuntimeSnapshot, TriggerType, KEYS, MAX_MODIFIERS,
     },
     profile_io,
     single_instance::BuildKind,
@@ -289,7 +289,7 @@ impl X360ceApp {
             snapshot
                 .devices
                 .iter()
-                .find(|device| device.guid == selected_guid)
+                .find(|device| same_device(&device.guid, &selected_guid))
                 .or_else(|| snapshot.devices.first())
                 .map(|device| device.name.clone())
         });
@@ -835,15 +835,34 @@ impl X360ceApp {
 
     fn poll_runtime(&mut self) {
         self.runtime = self.engine.snapshot();
-        if self.state.selected_device_guid.is_empty() {
-            let first_guid = self
-                .runtime
-                .devices
-                .first()
-                .map(|device| device.guid.clone());
-            if let Some(guid) = first_guid {
-                self.select_device(guid);
+        let selected = self.state.selected_device_guid.clone();
+        if self
+            .runtime
+            .devices
+            .iter()
+            .any(|device| device.guid == selected)
+        {
+            return;
+        }
+        // Сохранённого GUID нет в списке: пусто — берём первый контроллер,
+        // иначе ищем тот же контроллер (VID/PID) под новым GUID и переносим профиль.
+        let replacement = self
+            .runtime
+            .devices
+            .iter()
+            .find(|device| selected.is_empty() || same_device(&device.guid, &selected))
+            .map(|device| device.guid.clone());
+        if let Some(guid) = replacement {
+            if let Some(profile) = self.state.profiles.get(&selected).cloned() {
+                self.state
+                    .profiles
+                    .entry(guid.clone())
+                    .or_insert(ControllerProfile {
+                        device_guid: guid.clone(),
+                        ..profile
+                    });
             }
+            self.select_device(guid);
         }
     }
 }

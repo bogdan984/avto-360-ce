@@ -628,3 +628,37 @@ pub struct RuntimeSnapshot {
     pub last_error: Option<String>,
     pub last_controller_activity_sequence: u64,
 }
+
+/// Тот же физический контроллер, хотя GUID SDL другой. SDL меняет в GUID
+/// контрольную сумму имени и байт драйвера (RawInput/HIDAPI/DirectInput)
+/// от запуска к запуску, а VID и PID (символы 8..12 и 16..20) остаются.
+pub fn same_device(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let ids = |guid: &str| {
+        let guid = guid.to_ascii_lowercase();
+        (guid.len() == 32 && guid.is_ascii())
+            .then(|| (guid[8..12].to_owned(), guid[16..20].to_owned()))
+            .filter(|(vendor, _)| vendor != "0000")
+    };
+    matches!((ids(a), ids(b)), (Some(x), Some(y)) if x == y)
+}
+
+#[cfg(test)]
+mod same_device_tests {
+    use super::same_device;
+
+    #[test]
+    fn same_vid_pid_with_other_crc_and_driver_is_same_device() {
+        let raw = "03008d3a6d0400006dc2000000007200";
+        let dinput = "030000006d0400006dc2000000000000";
+        assert!(same_device(raw, dinput));
+        assert!(!same_device(raw, "030000006d0400001bc2000000000000"));
+        // GUID без VID/PID сравниваем только целиком.
+        assert!(!same_device(
+            "05000000000000000000000000000000",
+            "05000000000000000000000000000001"
+        ));
+    }
+}
