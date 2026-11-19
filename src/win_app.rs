@@ -36,6 +36,11 @@ const MIN_WINDOW_HEIGHT: f32 = 780.0;
 const VISIBLE_POLL: Duration = Duration::from_millis(16);
 const HIDDEN_POLL: Duration = Duration::from_millis(120);
 const AUTO_UPDATE_INTERVAL_SECONDS: u64 = 60 * 60;
+/// Автозапуск joy.cpl: попыток × пауза ≈ 2 мин (после включения ПК
+/// контроллер и список joy.cpl появляются не сразу).
+const JOYCPL_AUTOSTART_ATTEMPTS: u32 = 40;
+const JOYCPL_MANUAL_ATTEMPTS: u32 = 3;
+const JOYCPL_RETRY_PAUSE: Duration = Duration::from_secs(3);
 
 const BACKGROUND: Color32 = Color32::from_rgb(242, 244, 247);
 const SURFACE: Color32 = Color32::from_rgb(255, 255, 255);
@@ -223,8 +228,6 @@ struct X360ceApp {
     learning_key: Option<usize>,
     joycpl_pid: Option<u32>,
     joycpl_rx: Option<Receiver<Result<u32, String>>>,
-    /// joy.cpl ещё не открывали в этом запуске — откроем, как только найдётся контроллер.
-    joycpl_autostart: bool,
 }
 
 impl X360ceApp {
@@ -273,6 +276,25 @@ impl X360ceApp {
         let tray = TrayState::new(&state, false).ok();
         let controller_texture = load_controller_texture(&creation_context.egui_ctx);
 
+        // Автозапуск joy.cpl — в своём потоке, а не в цикле отрисовки:
+        // при запуске в трей скрытое окно не перерисовывается и joy.cpl не открывался.
+        let snapshot = engine.snapshot_handle();
+        let manual_name = state.joycpl_device_name.trim().to_owned();
+        let selected_guid = state.selected_device_guid.clone();
+        let joycpl_rx = spawn_joycpl(None, JOYCPL_AUTOSTART_ATTEMPTS, move || {
+            if !manual_name.is_empty() {
+                return Some(manual_name.clone());
+            }
+            let snapshot = snapshot.read().ok()?;
+            snapshot
+                .devices
+                .iter()
+                .find(|device| device.guid == selected_guid)
+                .or_else(|| snapshot.devices.first())
+                .map(|device| device.name.clone())
+        });
+        let status = format!("{status} Открываю «Игровые устройства» (joy.cpl)…");
+
         Self {
             state,
             engine,
@@ -293,8 +315,7 @@ impl X360ceApp {
             learning_keyboard_input: None,
             learning_key: None,
             joycpl_pid: None,
-            joycpl_rx: None,
-            joycpl_autostart: true,
+            joycpl_rx: Some(joycpl_rx),
         }
     }
 
@@ -570,31 +591,15 @@ impl X360ceApp {
                 .devices
                 .iter()
                 .find(|device| device.guid == self.state.selected_device_guid)
+                .or_else(|| self.runtime.devices.first())
                 .map(|device| device.name.clone())
-                .unwrap_or_default()
         } else {
-            self.state.joycpl_device_name.clone()
+            Some(self.state.joycpl_device_name.clone())
         };
         let previous = self.joycpl_pid.take();
-        let (sender, receiver) = unbounded();
-        thread::spawn(move || {
-            if let Some(pid) = previous {
-                joycpl::close(pid);
-            }
-            // После включения ПК список joy.cpl заполняется не сразу.
-            let mut result = Err(String::new());
-            for attempt in 0..3 {
-                if attempt > 0 {
-                    thread::sleep(Duration::from_secs(3));
-                }
-                result = joycpl::open(&name);
-                if result.is_ok() {
-                    break;
-                }
-            }
-            let _ = sender.send(result);
-        });
-        self.joycpl_rx = Some(receiver);
+        self.joycpl_rx = Some(spawn_joycpl(previous, JOYCPL_MANUAL_ATTEMPTS, move || {
+            name.clone()
+        }));
         self.status = "Открываю «Игровые устройства» (joy.cpl)…".to_owned();
     }
 
@@ -606,19 +611,6 @@ impl X360ceApp {
     }
 
     fn poll_joycpl(&mut self) {
-        // Открываем сразу, как только контроллер найден (или задано имя вручную).
-        if self.joycpl_autostart {
-            let device_known = !self.state.joycpl_device_name.trim().is_empty()
-                || self
-                    .runtime
-                    .devices
-                    .iter()
-                    .any(|device| device.guid == self.state.selected_device_guid);
-            if device_known {
-                self.joycpl_autostart = false;
-                self.start_joycpl();
-            }
-        }
         let Some(result) = self.joycpl_rx.as_ref().and_then(|rx| rx.try_recv().ok()) else {
             return;
         };
@@ -2888,4 +2880,34 @@ fn egui_key_to_vk(key: egui::Key) -> Option<u16> {
         K::Backtick => 0xC0,
         _ => return None,
     })
+}
+
+/// Открыть joy.cpl в фоне: до `attempts` попыток с паузой. `device_name`
+/// спрашивается на каждой попытке — контроллер может появиться позже.
+fn spawn_joycpl(
+    previous: Option<u32>,
+    attempts: u32,
+    device_name: impl Fn() -> Option<String> + Send + 'static,
+) -> Receiver<Result<u32, String>> {
+    let (sender, receiver) = unbounded();
+    thread::spawn(move || {
+        if let Some(pid) = previous {
+            joycpl::close(pid);
+        }
+        let mut result = Err("контроллер не найден".to_owned());
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                thread::sleep(JOYCPL_RETRY_PAUSE);
+            }
+            let Some(name) = device_name() else {
+                continue;
+            };
+            result = joycpl::open(&name);
+            if result.is_ok() {
+                break;
+            }
+        }
+        let _ = sender.send(result);
+    });
+    receiver
 }

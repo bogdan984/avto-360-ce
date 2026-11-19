@@ -51,9 +51,11 @@ pub fn open(device_name: &str) -> Result<u32, String> {
 
     // Окно ищем по содержимому (строка с устройством в списке), а не по PID:
     // диалог может оказаться в другом процессе, чем запущенный rundll32.
+    // Первые 3 с — только точное совпадение имени, потом и нестрогое
+    // (имя из SDL часто отличается от имени в списке joy.cpl).
     let mut found = None;
-    for _ in 0..150 {
-        found = find_device(&before, &needle);
+    for attempt in 0..150 {
+        found = find_device(&before, &needle, attempt >= 30);
         if found.is_some() {
             break;
         }
@@ -156,7 +158,7 @@ pub fn close_away() {
     }
 }
 
-fn find_device(before: &[HWND], needle: &str) -> Option<(HWND, HWND, usize)> {
+fn find_device(before: &[HWND], needle: &str, loose: bool) -> Option<(HWND, HWND, usize)> {
     for window in windows(None) {
         if before.contains(&window)
             || class_name(window) != "#32770"
@@ -171,15 +173,47 @@ fn find_device(before: &[HWND], needle: &str) -> Option<(HWND, HWND, usize)> {
             let Ok(names) = list_view_remote(list, None) else {
                 continue;
             };
-            for (index, name) in names.iter().enumerate() {
-                let name = name.to_lowercase();
-                if !name.is_empty() && (name.contains(needle) || needle.contains(&name)) {
-                    return Some((window, list, index));
-                }
+            let names: Vec<String> = names.iter().map(|name| name.to_lowercase()).collect();
+            let exact = names.iter().position(|name| {
+                !name.is_empty() && (name.contains(needle) || needle.contains(name.as_str()))
+            });
+            if let Some(index) =
+                exact.or_else(|| loose.then(|| loose_match(&names, needle)).flatten())
+            {
+                return Some((window, list, index));
             }
         }
     }
     None
+}
+
+/// Нестрогий выбор: строка с наибольшим числом общих слов с `needle`,
+/// а если общих слов нет — единственное реальное (не виртуальное) устройство.
+fn loose_match(names: &[String], needle: &str) -> Option<usize> {
+    let real: Vec<usize> = (0..names.len())
+        .filter(|&index| {
+            let name = &names[index];
+            !name.is_empty()
+                && !name.contains("xbox 360")
+                && !name.contains("vigem")
+                && !name.contains("virtual")
+        })
+        .collect();
+    let words: Vec<&str> = needle
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.chars().count() >= 3)
+        .collect();
+    let common = |index: usize| {
+        words
+            .iter()
+            .filter(|word| names[index].contains(*word))
+            .count()
+    };
+    real.iter()
+        .copied()
+        .filter(|&index| common(index) > 0)
+        .max_by_key(|&index| common(index))
+        .or_else(|| (real.len() == 1).then(|| real[0]))
 }
 
 fn away(hwnd: HWND) {
@@ -328,4 +362,23 @@ fn list_view_remote(list: HWND, select: Option<usize>) -> Result<Vec<String>, ()
         CloseHandle(process);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loose_match;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_lowercase()).collect()
+    }
+
+    #[test]
+    fn loose_match_picks_common_words_or_single_real_device() {
+        let list = names(&["Controller (XBOX 360 For Windows)", "ARTPLAYS V-1200 Wheel"]);
+        assert_eq!(loose_match(&list, "v-1200 racing wheel"), Some(1));
+        // Общих слов нет, но реальное устройство одно.
+        assert_eq!(loose_match(&list, "usb gamepad"), Some(1));
+        let two = names(&["Saitek X52 Flight Controller", "Logitech G29"]);
+        assert_eq!(loose_match(&two, "usb gamepad"), None);
+    }
 }

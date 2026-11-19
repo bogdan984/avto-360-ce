@@ -77,6 +77,11 @@ impl ControllerEngine {
         let _ = self.commands.send(command);
     }
 
+    /// Общий снимок — для фоновых потоков, которым не дождаться UI.
+    pub fn snapshot_handle(&self) -> Arc<RwLock<RuntimeSnapshot>> {
+        Arc::clone(&self.snapshot)
+    }
+
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.snapshot
             .read()
