@@ -4,16 +4,13 @@ use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, TextureHandle,
     TextureOptions,
 };
-use std::{
-    env, ptr, thread,
-    time::{Duration, Instant},
-};
+use std::{env, ptr, thread, time::Duration};
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon as TrayImage, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW,
 };
 
 use crate::{
@@ -39,8 +36,6 @@ const MIN_WINDOW_HEIGHT: f32 = 780.0;
 const VISIBLE_POLL: Duration = Duration::from_millis(16);
 const HIDDEN_POLL: Duration = Duration::from_millis(120);
 const AUTO_UPDATE_INTERVAL_SECONDS: u64 = 60 * 60;
-/// Сколько максимум ждать, пока движок найдёт контроллер, прежде чем открыть joy.cpl.
-const JOYCPL_AUTOSTART_DELAY: Duration = Duration::from_secs(6);
 
 const BACKGROUND: Color32 = Color32::from_rgb(242, 244, 247);
 const SURFACE: Color32 = Color32::from_rgb(255, 255, 255);
@@ -57,7 +52,6 @@ const CONTROLLER: Color32 = Color32::from_rgb(43, 47, 56);
 
 const MENU_OPEN: &str = "open";
 const MENU_ENABLED: &str = "enabled";
-const MENU_AUTO_TRAY: &str = "auto-tray";
 const MENU_STARTUP: &str = "startup";
 const MENU_CHECK: &str = "check";
 const MENU_INSTALL: &str = "install";
@@ -126,7 +120,6 @@ pub fn run() -> Result<()> {
 struct TrayState {
     icon: TrayIcon,
     enabled: CheckMenuItem,
-    auto_tray: CheckMenuItem,
     startup: CheckMenuItem,
     install: MenuItem,
 }
@@ -140,13 +133,6 @@ impl TrayState {
             "Виртуальный контроллер включён",
             true,
             state.emulation_enabled,
-            None,
-        );
-        let auto_tray = CheckMenuItem::with_id(
-            MENU_AUTO_TRAY,
-            "Сворачивать в трей при бездействии",
-            true,
-            state.auto_tray_enabled,
             None,
         );
         let startup = CheckMenuItem::with_id(
@@ -176,7 +162,6 @@ impl TrayState {
             &open,
             &separator,
             &enabled,
-            &auto_tray,
             &startup,
             &separator_updates,
             &check,
@@ -199,7 +184,6 @@ impl TrayState {
         Ok(Self {
             icon,
             enabled,
-            auto_tray,
             startup,
             install,
         })
@@ -207,7 +191,6 @@ impl TrayState {
 
     fn sync(&self, state: &SavedState, virtual_connected: bool, update_installable: bool) {
         self.enabled.set_checked(state.emulation_enabled);
-        self.auto_tray.set_checked(state.auto_tray_enabled);
         self.startup
             .set_checked(state.startup_enabled && !config::is_dev_build());
         self.install
@@ -231,10 +214,6 @@ struct X360ceApp {
     learning_output_negative: bool,
     learn_baseline: RawState,
     window_visible: bool,
-    quit_requested: bool,
-    last_activity: Instant,
-    last_controller_sequence: u64,
-    countdown_started: Option<Instant>,
     update_rx: Option<Receiver<anyhow::Result<updater::UpdateCheck>>>,
     last_update_check: Option<updater::UpdateCheck>,
     /// Редактируемый слой: None — основной, Some(n) — модификатор n.
@@ -244,7 +223,8 @@ struct X360ceApp {
     learning_key: Option<usize>,
     joycpl_pid: Option<u32>,
     joycpl_rx: Option<Receiver<Result<u32, String>>>,
-    joycpl_autostart_at: Option<Instant>,
+    /// joy.cpl ещё не открывали в этом запуске — откроем, как только найдётся контроллер.
+    joycpl_autostart: bool,
 }
 
 impl X360ceApp {
@@ -290,9 +270,6 @@ impl X360ceApp {
         if let Err(error) = game_bar_result {
             status = format!("Не удалось обновить блокировку Xbox Game Bar: {error}");
         }
-        let joycpl_autostart_at = state
-            .joycpl_on_start
-            .then(|| Instant::now() + JOYCPL_AUTOSTART_DELAY);
         let tray = TrayState::new(&state, false).ok();
         let controller_texture = load_controller_texture(&creation_context.egui_ctx);
 
@@ -309,10 +286,6 @@ impl X360ceApp {
             learning_output_negative: false,
             learn_baseline: RawState::default(),
             window_visible,
-            quit_requested: false,
-            last_activity: Instant::now(),
-            last_controller_sequence: 0,
-            countdown_started: None,
             update_rx: None,
             last_update_check: None,
             edit_layer: None,
@@ -321,7 +294,7 @@ impl X360ceApp {
             learning_key: None,
             joycpl_pid: None,
             joycpl_rx: None,
-            joycpl_autostart_at,
+            joycpl_autostart: true,
         }
     }
 
@@ -353,7 +326,6 @@ impl X360ceApp {
     fn profile_changed(&mut self) {
         self.push_profile();
         self.save();
-        self.mark_activity();
     }
 
     fn cancel_learning(&mut self) {
@@ -415,7 +387,6 @@ impl X360ceApp {
         self.engine.send(EngineCommand::SelectDevice(guid));
         self.push_profile();
         self.status = "Контроллер выбран.".to_owned();
-        self.mark_activity();
         self.save();
     }
 
@@ -427,7 +398,6 @@ impl X360ceApp {
         } else {
             "Виртуальный контроллер приостановлен.".to_owned()
         };
-        self.mark_activity();
         self.save();
         self.sync_tray();
     }
@@ -440,8 +410,6 @@ impl X360ceApp {
 
     fn show_window(&mut self, ctx: &egui::Context) {
         self.window_visible = true;
-        self.countdown_started = None;
-        self.last_activity = Instant::now();
         self.sync_forwarding_mode();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -449,57 +417,8 @@ impl X360ceApp {
 
     fn hide_window(&mut self, ctx: &egui::Context) {
         self.window_visible = false;
-        self.countdown_started = None;
         self.sync_forwarding_mode();
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-    }
-
-    fn mark_activity(&mut self) {
-        self.last_activity = Instant::now();
-        self.countdown_started = None;
-    }
-
-    fn poll_activity(&mut self, ctx: &egui::Context) {
-        let ui_active = ctx.input(|input| {
-            !input.events.is_empty()
-                || input.pointer.any_down()
-                || input.pointer.delta() != egui::Vec2::ZERO
-        });
-        if ui_active {
-            self.mark_activity();
-        }
-
-        if self.runtime.last_controller_activity_sequence != self.last_controller_sequence {
-            self.last_controller_sequence = self.runtime.last_controller_activity_sequence;
-            self.mark_activity();
-        }
-    }
-
-    fn poll_auto_tray(&mut self, ctx: &egui::Context) {
-        if !self.window_visible || !self.state.auto_tray_enabled {
-            self.countdown_started = None;
-            return;
-        }
-
-        let idle = Duration::from_secs(self.state.auto_tray_idle_seconds.max(1));
-        if self.last_activity.elapsed() < idle {
-            self.countdown_started = None;
-            return;
-        }
-
-        let started = self.countdown_started.get_or_insert_with(Instant::now);
-        let countdown = Duration::from_secs(self.state.auto_tray_countdown_seconds.max(1));
-        if started.elapsed() >= countdown {
-            self.hide_window(ctx);
-            self.status = "Свёрнуто в трей из-за бездействия.".to_owned();
-            self.save();
-        }
-    }
-
-    fn countdown_remaining(&self) -> Option<u64> {
-        let started = self.countdown_started?;
-        let total = self.state.auto_tray_countdown_seconds.max(1);
-        Some(total.saturating_sub(started.elapsed().as_secs()).max(1))
     }
 
     fn poll_learning(&mut self) {
@@ -602,7 +521,6 @@ impl X360ceApp {
             "Нажмите или отклоните {direction} для «{}».",
             control.label()
         );
-        self.mark_activity();
     }
 
     fn begin_learning_input(&mut self, modifier: Option<usize>, keyboard: Option<usize>) {
@@ -611,14 +529,12 @@ impl X360ceApp {
         self.learning_keyboard_input = keyboard;
         self.learn_baseline = self.runtime.raw_state.clone();
         self.status = "Нажмите кнопку на контроллере (Esc — отмена).".to_owned();
-        self.mark_activity();
     }
 
     fn begin_learning_key(&mut self, index: usize) {
         self.cancel_learning();
         self.learning_key = Some(index);
         self.status = "Нажмите клавишу на клавиатуре (Esc — отмена).".to_owned();
-        self.mark_activity();
     }
 
     /// Захват клавиши клавиатуры для назначения (режим «Захват клавиши»).
@@ -690,15 +606,16 @@ impl X360ceApp {
     }
 
     fn poll_joycpl(&mut self) {
-        if let Some(at) = self.joycpl_autostart_at {
+        // Открываем сразу, как только контроллер найден (или задано имя вручную).
+        if self.joycpl_autostart {
             let device_known = !self.state.joycpl_device_name.trim().is_empty()
                 || self
                     .runtime
                     .devices
                     .iter()
                     .any(|device| device.guid == self.state.selected_device_guid);
-            if device_known || Instant::now() >= at {
-                self.joycpl_autostart_at = None;
+            if device_known {
+                self.joycpl_autostart = false;
                 self.start_joycpl();
             }
         }
@@ -713,6 +630,27 @@ impl X360ceApp {
             }
             Err(error) => self.status = format!("joy.cpl: {error}"),
         }
+    }
+
+    /// Полный выход: окно прячется сразу, затем закрываются joy.cpl, движок
+    /// (отпускает клавиши) и значок в трее. Процесс завершается здесь же —
+    /// не зависим от того, обработает ли eframe закрытие скрытого окна.
+    fn quit(&mut self) {
+        let title = str_wide_null(&config::window_title());
+        unsafe {
+            let hwnd = FindWindowW(ptr::null(), title.as_ptr());
+            if !hwnd.is_null() {
+                ShowWindow(hwnd, SW_HIDE);
+            }
+        }
+        self.save();
+        self.tray = None;
+        self.engine.stop();
+        if let Some(pid) = self.joycpl_pid.take() {
+            joycpl::close(pid);
+        }
+        joycpl::close_away();
+        std::process::exit(0);
     }
 
     fn clear_mapping(&mut self, control: OutputControl) {
@@ -753,7 +691,6 @@ impl X360ceApp {
             );
             self.push_profile();
             self.save();
-            self.mark_activity();
         }
     }
 
@@ -787,7 +724,6 @@ impl X360ceApp {
                 self.selected_axis_negative = None;
                 self.status = format!("Назначения импортированы: {}", path.display());
                 self.save();
-                self.mark_activity();
             }
             Ok(None) => {
                 self.status = "Импорт отменён.".to_owned();
@@ -818,19 +754,10 @@ impl X360ceApp {
             match event.id.as_ref() {
                 MENU_OPEN => self.show_window(ctx),
                 MENU_ENABLED => self.set_emulation_enabled(!self.state.emulation_enabled),
-                MENU_AUTO_TRAY => {
-                    self.state.auto_tray_enabled = !self.state.auto_tray_enabled;
-                    self.mark_activity();
-                    self.save();
-                    self.sync_tray();
-                }
                 MENU_STARTUP => self.toggle_startup(),
                 MENU_CHECK => self.start_update_check(),
                 MENU_INSTALL => self.install_update(),
-                MENU_QUIT => {
-                    self.quit_requested = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                MENU_QUIT => self.quit(),
                 _ => {}
             }
         }
@@ -927,39 +854,12 @@ impl X360ceApp {
             }
         }
     }
-
-    fn render_countdown(&mut self, ctx: &egui::Context) {
-        let Some(remaining) = self.countdown_remaining() else {
-            return;
-        };
-        egui::Window::new("Сворачивание в трей")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.set_width(320.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        RichText::new(remaining.to_string())
-                            .size(48.0)
-                            .strong()
-                            .color(ACCENT),
-                    );
-                    ui.label("Нет активности. x360ce продолжит работу в трее.");
-                    ui.add_space(8.0);
-                    if ui.button("Не сворачивать").clicked() {
-                        self.mark_activity();
-                    }
-                });
-            });
-    }
 }
 
 impl eframe::App for X360ceApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|input| input.viewport().close_requested()) && !self.quit_requested {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.hide_window(ctx);
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.quit();
         }
 
         let learning = self.learning_control.is_some()
@@ -969,16 +869,13 @@ impl eframe::App for X360ceApp {
         if learning && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.cancel_learning();
             self.status = "Захват назначения отменён.".to_owned();
-            self.mark_activity();
         }
 
         self.poll_runtime();
         self.poll_tray(ctx);
-        self.poll_activity(ctx);
         self.poll_learning();
         self.poll_key_capture(ctx);
         self.poll_joycpl();
-        self.poll_auto_tray(ctx);
         self.maybe_start_automatic_update_check();
         self.poll_update_check();
         self.sync_tray();
@@ -995,10 +892,7 @@ impl eframe::App for X360ceApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.save();
-        if let Some(pid) = self.joycpl_pid.take() {
-            joycpl::close(pid);
-        }
+        self.quit();
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -1089,7 +983,6 @@ impl X360ceApp {
                     if ui.button("Обновить").clicked() {
                         self.engine.send(EngineCommand::Refresh);
                         self.status = "Обновление списка контроллеров…".to_owned();
-                        self.mark_activity();
                     }
                     if ui
                         .button(if self.state.emulation_enabled {
@@ -1158,7 +1051,6 @@ impl X360ceApp {
                 if ui.button("Обновить").clicked() {
                     self.engine.send(EngineCommand::Refresh);
                     self.status = "Обновление списка контроллеров…".to_owned();
-                    self.mark_activity();
                 }
             });
         });
@@ -1407,7 +1299,6 @@ impl X360ceApp {
                 if changed {
                     self.push_profile();
                     self.save();
-                    self.mark_activity();
                 }
             }
 
@@ -1468,10 +1359,24 @@ impl X360ceApp {
                             let mut clear_clicked = false;
                             let response = ui
                                 .horizontal(|ui| {
-                                    let row_width = (ui.available_width() - 30.0).max(110.0);
-                                    ui.set_min_width(row_width);
-                                    let response =
-                                        ui.selectable_label(self.selected_control == *item, rich);
+                                    // Подпись фиксированной ширины — все «×» на одной вертикали.
+                                    let label_width = (ui.available_width() - 30.0).max(110.0);
+                                    let response = ui
+                                        .allocate_ui_with_layout(
+                                            egui::vec2(label_width, ui.spacing().interact_size.y),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                ui.set_min_width(label_width);
+                                                ui.add(
+                                                    egui::Button::selectable(
+                                                        self.selected_control == *item,
+                                                        rich,
+                                                    )
+                                                    .truncate(),
+                                                )
+                                            },
+                                        )
+                                        .inner;
                                     clear_clicked = ui
                                         .add_enabled(mapped, egui::Button::new("×"))
                                         .on_hover_text("Очистить назначение")
@@ -1487,7 +1392,6 @@ impl X360ceApp {
                             } else if response.clicked() {
                                 self.selected_control = *item;
                                 self.selected_axis_negative = None;
-                                self.mark_activity();
                             }
                         }
                     });
@@ -1520,7 +1424,6 @@ impl X360ceApp {
                     {
                         self.edit_layer = layer;
                         self.cancel_learning();
-                        self.mark_activity();
                     }
                 }
             });
@@ -1953,9 +1856,6 @@ impl X360ceApp {
             let mut changed = false;
             ui.columns(2, |columns| {
                 changed |= columns[0]
-                    .checkbox(&mut self.state.auto_tray_enabled, "Авто-трей")
-                    .changed();
-                changed |= columns[0]
                     .checkbox(&mut self.state.start_in_tray, "Запуск в трее")
                     .changed();
                 changed |= columns[0]
@@ -1985,7 +1885,6 @@ impl X360ceApp {
                 if let Err(error) = game_bar::install_hard_block() {
                     self.status = format!("Не удалось обновить блокировку Xbox Game Bar: {error}");
                 }
-                self.mark_activity();
                 self.save();
                 self.sync_tray();
             }
@@ -2058,17 +1957,13 @@ impl X360ceApp {
             ui.label(
                 RichText::new(
                     "Некоторые рули и джойстики отдают часть кнопок, только пока открыты их \
-                     «Свойства». Окно открывается за краем экрана и закрывается при выходе.",
+                     «Свойства». Они открываются при запуске программы за краем экрана и \
+                     закрываются при выходе.",
                 )
                 .size(11.0)
                 .color(MUTED),
             );
-            let mut joy_changed = ui
-                .checkbox(
-                    &mut self.state.joycpl_on_start,
-                    "Открывать свойства устройства при запуске",
-                )
-                .changed();
+            let mut joy_changed = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Имя в joy.cpl").size(11.0).color(MUTED));
                 joy_changed |= ui
@@ -2081,7 +1976,6 @@ impl X360ceApp {
             });
             if joy_changed {
                 self.save();
-                self.mark_activity();
             }
             ui.horizontal_wrapped(|ui| {
                 let open_label = if self.joycpl_rx.is_some() {
@@ -2332,7 +2226,6 @@ fn ui_root(app: &mut X360ceApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                 });
             });
         });
-    app.render_countdown(ui.ctx());
 }
 
 fn compact_surface(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -2411,7 +2304,6 @@ fn controller_control(
     } else if response.clicked() {
         app.selected_control = control;
         app.selected_axis_negative = None;
-        app.mark_activity();
     }
 
     let entry = profile.entry(control);
@@ -2588,7 +2480,6 @@ fn draw_stick_controls(
         } else if response.clicked() {
             app.selected_control = control;
             app.selected_axis_negative = Some(output_negative);
-            app.mark_activity();
         }
 
         let entry = profile.entry(control);

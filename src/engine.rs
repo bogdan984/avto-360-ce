@@ -85,12 +85,19 @@ impl ControllerEngine {
     }
 }
 
-impl Drop for ControllerEngine {
-    fn drop(&mut self) {
+impl ControllerEngine {
+    /// Остановить движок и дождаться его (отпускает зажатые клавиши).
+    pub fn stop(&mut self) {
         let _ = self.commands.send(EngineCommand::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+}
+
+impl Drop for ControllerEngine {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

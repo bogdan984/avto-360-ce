@@ -6,7 +6,7 @@ use std::{
     ffi::c_void, os::windows::process::CommandExt, process::Command, ptr, thread, time::Duration,
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HWND, LPARAM},
+    Foundation::{CloseHandle, HWND, LPARAM, RECT},
     System::{
         Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory},
         Memory::{
@@ -14,10 +14,11 @@ use windows_sys::Win32::{
         },
         Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE},
     },
+    UI::Input::KeyboardAndMouse::IsWindowEnabled,
     UI::WindowsAndMessaging::{
-        EnumChildWindows, EnumWindows, GetClassNameW, GetWindowTextW, GetWindowThreadProcessId,
-        IsWindowVisible, PostMessageW, SendMessageW, SetWindowPos, SWP_NOACTIVATE, SWP_NOSIZE,
-        SWP_NOZORDER,
+        EnumChildWindows, EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindowVisible, PostMessageW, SendMessageW, SetWindowPos,
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
     },
 };
 
@@ -37,10 +38,11 @@ pub fn open(device_name: &str) -> Result<u32, String> {
     if needle.is_empty() {
         return Err("не задано имя устройства".to_owned());
     }
-    // Окна joy.cpl, открытые до нас вручную, не трогаем.
+    // Окна joy.cpl, открытые до нас вручную, не трогаем. Окно, уже стоящее
+    // за краем экрана, — наше (осталось от прошлого запуска): берём его.
     let before: Vec<HWND> = windows(None)
         .into_iter()
-        .filter(|hwnd| class_name(*hwnd) == "#32770")
+        .filter(|hwnd| class_name(*hwnd) == "#32770" && !is_away(*hwnd))
         .collect();
     let mut child = Command::new("rundll32.exe")
         .args(["shell32.dll,Control_RunDLL", "joy.cpl"])
@@ -73,15 +75,20 @@ pub fn open(device_name: &str) -> Result<u32, String> {
         }
     });
     let Some(button) = button else {
+        close(dialog_pid);
         let _ = child.kill();
         return Err("кнопка «Свойства» не найдена".to_owned());
     };
-    // PostMessage: SendMessage ждал бы закрытия модального окна свойств.
-    // После нажатия процесс не убиваем — это ломает драйверы до переподключения.
-    unsafe { PostMessageW(button, BM_CLICK, 0, 0) };
 
     let mut sheets = Vec::new();
-    for _ in 0..150 {
+    for attempt in 0..150 {
+        // PostMessage: SendMessage ждал бы закрытия модального окна свойств.
+        // Раз в секунду повторяем: кнопка включается не сразу после выбора строки.
+        // После нажатия процесс не убиваем — это ломает драйверы до переподключения.
+        if attempt % 10 == 0 && unsafe { IsWindowEnabled(button) } != 0 {
+            let _ = list_view_remote(list, Some(index));
+            unsafe { PostMessageW(button, BM_CLICK, 0, 0) };
+        }
         sheets = windows(None)
             .into_iter()
             .filter(|hwnd| {
@@ -105,6 +112,8 @@ pub fn open(device_name: &str) -> Result<u32, String> {
         away(*hwnd);
     }
     if sheets.is_empty() {
+        // Не оставляем joy.cpl висеть за экраном — он мешал следующим попыткам.
+        close(dialog_pid);
         return Err("окно свойств не найдено".to_owned());
     }
     Ok(dialog_pid)
@@ -130,6 +139,20 @@ pub fn close(pid: u32) {
             Err(_) => break,
             _ => thread::sleep(Duration::from_millis(500)),
         }
+    }
+}
+
+/// Закрыть все окна joy.cpl, стоящие за краем экрана (их открываем только мы).
+pub fn close_away() {
+    let mut pids: Vec<u32> = windows(None)
+        .into_iter()
+        .filter(|hwnd| class_name(*hwnd) == "#32770" && is_away(*hwnd))
+        .map(window_pid)
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    for pid in pids {
+        close(pid);
     }
 }
 
@@ -171,6 +194,17 @@ fn away(hwnd: HWND) {
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
+}
+
+fn is_away(hwnd: HWND) -> bool {
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let ok = unsafe { GetWindowRect(hwnd, &mut rect) } != 0;
+    ok && rect.left <= -30000
 }
 
 unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> windows_sys::core::BOOL {
