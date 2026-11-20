@@ -48,6 +48,9 @@ pub struct SavedState {
     /// Имя устройства в списке joy.cpl; пусто — выбранный контроллер.
     #[serde(default)]
     pub joycpl_device_name: String,
+    /// Сохранённые именованные профили (не привязаны к устройству).
+    #[serde(default)]
+    pub library: Vec<ControllerProfile>,
 }
 
 impl Default for SavedState {
@@ -68,6 +71,7 @@ impl Default for SavedState {
             last_status: "Готово.".to_owned(),
             joycpl_on_start: false,
             joycpl_device_name: String::new(),
+            library: Vec::new(),
         }
     }
 }
@@ -130,7 +134,10 @@ pub fn load_state() -> SavedState {
         data_dir.join(CONFIG_FILE_NAME),
         data_dir.join(BACKUP_FILE_NAME),
     ] {
-        if let Ok(state) = read_state_from_path(&path) {
+        if let Ok(mut state) = read_state_from_path(&path) {
+            for profile in state.profiles.values_mut().chain(state.library.iter_mut()) {
+                profile.sanitize();
+            }
             return state;
         }
     }

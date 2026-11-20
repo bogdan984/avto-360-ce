@@ -19,7 +19,7 @@ use crate::{
     engine::{ControllerEngine, EngineCommand},
     game_bar, joycpl, mapper,
     model::{
-        entry_mut_in, key_name, same_device, ControllerProfile, InputBinding, KeyOutput,
+        entry_mut_in, inputs_overlap, key_name, same_device, ControllerProfile, InputBinding, KeyOutput,
         KeyboardMapping, MappingEntry, ModifierConfig, ModifierMode, OutputControl, PaddleAxis,
         PressMode, RawState, RuntimeSnapshot, TriggerType, KEYS, MAX_MODIFIERS,
     },
@@ -228,6 +228,8 @@ struct X360ceApp {
     learning_key: Option<usize>,
     joycpl_pid: Option<u32>,
     joycpl_rx: Option<Receiver<Result<u32, String>>>,
+    /// Поле «Имя» в блоке профилей.
+    profile_name_edit: String,
 }
 
 impl X360ceApp {
@@ -253,6 +255,7 @@ impl X360ceApp {
                     ControllerProfile::default_for(state.selected_device_guid.clone())
                 })
         };
+        let profile_name_edit = initial_profile.name.clone();
         // Guide output is intentionally always blocked. Keep persisted state
         // aligned with actual behavior and Windows registry policy.
         state.block_game_bar_controller_button = true;
@@ -316,6 +319,7 @@ impl X360ceApp {
             learning_key: None,
             joycpl_pid: None,
             joycpl_rx: Some(joycpl_rx),
+            profile_name_edit,
         }
     }
 
@@ -404,7 +408,7 @@ impl X360ceApp {
             return;
         }
         self.state.selected_device_guid = guid.clone();
-        self.current_profile_mut();
+        self.profile_name_edit = self.current_profile_mut().name.clone();
         self.engine.send(EngineCommand::SelectDevice(guid));
         self.push_profile();
         self.status = "Контроллер выбран.".to_owned();
@@ -463,11 +467,14 @@ impl X360ceApp {
             return;
         }
         if let Some(index) = self.learning_keyboard_input.take() {
+            let mut layer = None;
             if let Some(mapping) = self.current_profile_mut().keyboard.get_mut(index) {
                 mapping.input = binding;
+                layer = mapping.modifier;
             }
+            let released = self.release_conflicts(layer, binding, false, None, Some(index));
             self.status = format!(
-                "Клавиатурное назначение {}: {}.",
+                "Клавиатурное назначение {}: {}.{released}",
                 index + 1,
                 binding.label()
             );
@@ -495,7 +502,7 @@ impl X360ceApp {
             false
         };
         let output_negative = self.learning_output_negative;
-        {
+        let full = {
             let mapping = self.edit_entry_mut(control);
             mapping.binding = binding;
             mapping.centered_axis = centered_axis;
@@ -504,11 +511,13 @@ impl X360ceApp {
             } else if control.is_trigger() {
                 mapping.invert = false;
             }
-        }
+            mapping.uses_full_axis()
+        };
+        let released = self.release_conflicts(self.edit_layer, binding, full, Some(control), None);
 
         self.learning_control = None;
         self.learning_output_negative = false;
-        self.status = format!("{}: {}.", control.label(), binding.label());
+        self.status = format!("{}: {}.{released}", control.label(), binding.label());
         self.push_profile();
         self.save();
     }
@@ -686,10 +695,119 @@ impl X360ceApp {
         }
     }
 
+    /// Снимает назначения слоя, которые срабатывают от того же физического
+    /// входа (Xbox и клавиши), кроме `skip_*`. Возвращает текст для статуса.
+    fn release_conflicts(
+        &mut self,
+        layer: Option<usize>,
+        binding: InputBinding,
+        full: bool,
+        skip_control: Option<OutputControl>,
+        skip_key: Option<usize>,
+    ) -> String {
+        let profile = self.current_profile();
+        let (controls, keys) = conflicts_for(&profile, layer, binding, full, skip_control, skip_key);
+        if controls.is_empty() && keys.is_empty() {
+            return String::new();
+        }
+        let names = conflict_names(&profile, &controls, &keys);
+        let profile = self.current_profile_mut();
+        let entries = match layer.filter(|layer| *layer < profile.modifiers.len()) {
+            Some(layer) => &mut profile.modifiers[layer].entries,
+            None => &mut profile.entries,
+        };
+        for control in controls {
+            entry_mut_in(entries, control).binding = InputBinding::None;
+        }
+        for index in keys {
+            profile.keyboard[index].input = InputBinding::None;
+        }
+        format!(" Снято с конфликтующих: {names}.")
+    }
+
+    /// «Руль — джойстик, остальное — клавиатура»: в основном слое остаётся
+    /// только левый стик X (поворот руля), прежние назначения — в библиотеку.
+    fn apply_wheel_keyboard_preset(&mut self) {
+        let mut backup = self.current_profile();
+        backup.name = format!("{} (до «руль + клавиатура»)", backup.name);
+        let backup_name = backup.name.clone();
+        self.upsert_library(backup);
+        for entry in &mut self.current_profile_mut().entries {
+            if entry.control != OutputControl::LeftStickX {
+                entry.binding = InputBinding::None;
+            }
+        }
+        self.edit_layer = None;
+        self.cancel_learning();
+        self.status = format!(
+            "Руль = левый стик X, остальные назначения Xbox сняты — назначьте кнопки и педали \
+             на клавиши. Прежние назначения сохранены в профиль «{backup_name}»."
+        );
+        self.profile_changed();
+    }
+
+    fn upsert_library(&mut self, mut profile: ControllerProfile) {
+        profile.device_guid.clear();
+        match self.state.library.iter_mut().find(|saved| saved.name == profile.name) {
+            Some(slot) => *slot = profile,
+            None => self.state.library.push(profile),
+        }
+        self.state
+            .library
+            .sort_by_key(|saved| saved.name.to_lowercase());
+    }
+
+    /// Делает профиль активным для выбранного контроллера.
+    fn activate_profile(&mut self, mut profile: ControllerProfile) {
+        let guid = self.state.selected_device_guid.clone();
+        profile.device_guid = guid.clone();
+        self.profile_name_edit = profile.name.clone();
+        self.state.profiles.insert(guid, profile);
+        self.edit_layer = None;
+        self.cancel_learning();
+        self.selected_axis_negative = None;
+        self.push_profile();
+    }
+
+    fn save_profile_to_library(&mut self) {
+        let name = self.profile_name_edit.trim().to_owned();
+        if name.is_empty() {
+            self.status = "Введите имя профиля.".to_owned();
+            return;
+        }
+        let existed = self.state.library.iter().any(|saved| saved.name == name);
+        self.current_profile_mut().name = name.clone();
+        let profile = self.current_profile();
+        self.upsert_library(profile);
+        self.profile_name_edit = name.clone();
+        self.status = if existed {
+            format!("Профиль «{name}» перезаписан.")
+        } else {
+            format!("Профиль «{name}» сохранён.")
+        };
+        self.profile_changed();
+    }
+
+    fn load_library_profile(&mut self, name: &str) {
+        let Some(profile) = self.state.library.iter().find(|saved| saved.name == name).cloned()
+        else {
+            return;
+        };
+        self.activate_profile(profile);
+        self.status = format!("Загружен профиль «{name}».");
+        self.save();
+    }
+
+    fn delete_library_profile(&mut self, name: &str) {
+        self.state.library.retain(|saved| saved.name != name);
+        self.status = format!("Профиль «{name}» удалён из списка (текущие назначения не изменены).");
+        self.save();
+    }
+
     fn export_current_mapping(&mut self) {
         match profile_io::export_profile(&self.current_profile()) {
             Ok(Some(path)) => {
-                self.status = format!("Назначения экспортированы: {}", path.display());
+                self.status = format!("Профиль экспортирован: {}", path.display());
             }
             Ok(None) => {
                 self.status = "Экспорт отменён.".to_owned();
@@ -703,18 +821,16 @@ impl X360ceApp {
     fn import_mapping(&mut self) {
         match profile_io::import_profile() {
             Ok(Some((path, mut profile))) => {
-                let guid = self.state.selected_device_guid.clone();
-                profile.device_guid = guid.clone();
-                if profile.name.trim().is_empty() {
-                    profile.name = "Импортированный профиль".to_owned();
+                let base = profile.name.clone();
+                let mut number = 2;
+                while self.state.library.iter().any(|saved| saved.name == profile.name) {
+                    profile.name = format!("{base} ({number})");
+                    number += 1;
                 }
-                self.state.profiles.insert(guid, profile.clone());
-                self.engine.send(EngineCommand::SetProfile(profile));
-                self.edit_layer = None;
-                self.learning_control = None;
-                self.learning_output_negative = false;
-                self.selected_axis_negative = None;
-                self.status = format!("Назначения импортированы: {}", path.display());
+                self.upsert_library(profile.clone());
+                let name = profile.name.clone();
+                self.activate_profile(profile);
+                self.status = format!("Профиль «{name}» импортирован и включён: {}", path.display());
                 self.save();
             }
             Ok(None) => {
@@ -1015,6 +1131,83 @@ impl X360ceApp {
         });
     }
 
+    fn render_profiles(&mut self, ui: &mut egui::Ui) {
+        surface(ui, |ui| {
+            let active = self.current_profile();
+            let saved = self
+                .state
+                .library
+                .iter()
+                .find(|saved| saved.name == active.name)
+                .map(|saved| same_mappings(saved, &active));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Профили").strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let (text, color) = match saved {
+                        Some(true) => ("сохранён", SUCCESS),
+                        Some(false) => ("есть несохранённые изменения", WARNING),
+                        None => ("не сохранён в список", MUTED),
+                    };
+                    ui.label(RichText::new(text).size(11.0).color(color));
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Имя:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.profile_name_edit)
+                        .hint_text("Название профиля")
+                        .desired_width(200.0),
+                );
+                if ui
+                    .button("Сохранить")
+                    .on_hover_text("Сохранить текущие назначения под этим именем (перезапишет одноимённый)")
+                    .clicked()
+                {
+                    self.save_profile_to_library();
+                }
+            });
+            let names: Vec<String> = self.state.library.iter().map(|saved| saved.name.clone()).collect();
+            let mut load = None;
+            let mut delete = None;
+            ui.horizontal_wrapped(|ui| {
+                egui::ComboBox::from_id_salt("profile-library")
+                    .selected_text(format!("Загрузить ({})", names.len()))
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        if names.is_empty() {
+                            ui.label("Список пуст — нажмите «Сохранить»");
+                        }
+                        for name in &names {
+                            if ui.selectable_label(*name == active.name, name).clicked() {
+                                load = Some(name.clone());
+                            }
+                        }
+                    });
+                if ui.button("Импорт…").on_hover_text("Загрузить профиль из файла .json").clicked() {
+                    self.import_mapping();
+                }
+                if ui.button("Экспорт…").on_hover_text("Сохранить текущий профиль в файл .json").clicked() {
+                    self.export_current_mapping();
+                }
+                let name = self.profile_name_edit.trim().to_owned();
+                if ui
+                    .add_enabled(names.contains(&name), egui::Button::new("Удалить"))
+                    .on_hover_text("Удалить профиль с этим именем из списка")
+                    .clicked()
+                {
+                    delete = Some(name);
+                }
+            });
+            if let Some(name) = load {
+                self.load_library_profile(&name);
+            }
+            if let Some(name) = delete {
+                self.delete_library_profile(&name);
+            }
+        });
+    }
+
     fn render_device_bar(&mut self, ui: &mut egui::Ui) {
         surface(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1214,12 +1407,6 @@ impl X360ceApp {
                 {
                     self.clear_mapping(control);
                 }
-                if ui.button("Экспорт").clicked() {
-                    self.export_current_mapping();
-                }
-                if ui.button("Импорт").clicked() {
-                    self.import_mapping();
-                }
             });
             ui.label(
                 RichText::new(format!(
@@ -1229,6 +1416,49 @@ impl X360ceApp {
                 .size(11.0)
                 .color(MUTED),
             );
+
+            if let Some(entry) = selected_entry
+                .as_ref()
+                .filter(|entry| entry.binding != InputBinding::None)
+            {
+                let full_profile = self.current_profile();
+                let (controls, keys) = conflicts_for(
+                    &full_profile,
+                    self.edit_layer,
+                    entry.binding,
+                    entry.uses_full_axis(),
+                    Some(control),
+                    None,
+                );
+                if !controls.is_empty() || !keys.is_empty() {
+                    let names = conflict_names(&full_profile, &controls, &keys);
+                    let note = if keys.is_empty() {
+                        "оба сработают одновременно"
+                    } else {
+                        "клавиша главнее — как Xbox этот вход не сработает"
+                    };
+                    let mut release = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            RichText::new(format!("! Тот же вход у: {names} ({note})."))
+                                .size(11.0)
+                                .color(WARNING),
+                        );
+                        release = ui.small_button("Снять с них").clicked();
+                    });
+                    if release {
+                        let released = self.release_conflicts(
+                            self.edit_layer,
+                            entry.binding,
+                            entry.uses_full_axis(),
+                            Some(control),
+                            None,
+                        );
+                        self.status = format!("{}:{released}", control.label());
+                        self.profile_changed();
+                    }
+                }
+            }
 
             if !control.is_axis() && (self.edit_layer.is_none() || selected_mapped) {
                 let current = selected_entry
@@ -1263,7 +1493,55 @@ impl X360ceApp {
                 );
             } else if control.is_axis() || control.is_trigger() {
                 ui.add_space(8.0);
-                if let Some(binding) = selected_entry.as_ref().map(|entry| entry.binding) {
+                let binding = selected_entry
+                    .as_ref()
+                    .map(|entry| entry.binding)
+                    .unwrap_or_default();
+                let centered = selected_entry
+                    .as_ref()
+                    .map(|entry| entry.centered_axis)
+                    .unwrap_or(false);
+                let mut set_centered = None;
+                if control.is_trigger() {
+                    if let Some(positive) = axis_binding_positive(binding) {
+                        ui.label(
+                            RichText::new("Срабатывает, когда ось уходит")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(!positive, "в минус (−)").clicked() {
+                                self.set_axis_binding_direction(control, false);
+                            }
+                            if ui.selectable_label(positive, "в плюс (+)").clicked() {
+                                self.set_axis_binding_direction(control, true);
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(centered, "Половина оси")
+                                .on_hover_text(
+                                    "Газ и тормоз на одной оси: в покое ось в центре, \
+                                     одна педаль ведёт её в минус, другая в плюс. \
+                                     Назначьте одной педали «в минус», другой «в плюс».",
+                                )
+                                .clicked()
+                            {
+                                set_centered = Some(true);
+                            }
+                            if ui
+                                .selectable_label(!centered, "Вся ось")
+                                .on_hover_text(
+                                    "Отдельная педаль: в покое ось в одном крае, \
+                                     нажатие ведёт её в другой край.",
+                                )
+                                .clicked()
+                            {
+                                set_centered = Some(false);
+                            }
+                        });
+                    }
+                } else {
                     if let Some(positive) = axis_binding_positive(binding) {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -1286,10 +1564,9 @@ impl X360ceApp {
                     let mapping = self.edit_entry_mut(control);
                     ui.horizontal_wrapped(|ui| {
                         changed |= ui.checkbox(&mut mapping.invert, "Инвертировать").changed();
-                        if control.is_trigger() {
-                            changed |= ui
-                                .checkbox(&mut mapping.centered_axis, "Половина оси")
-                                .changed();
+                        if let Some(centered) = set_centered {
+                            mapping.centered_axis = centered;
+                            changed = true;
                         }
                     });
                     changed |= ui
@@ -1553,12 +1830,25 @@ impl X360ceApp {
             ui.label(RichText::new("Клавиатура").strong());
             ui.label(
                 RichText::new(
-                    "Кнопки контроллера нажимают клавиши Windows. При включённом «Работать \
-                     только в трее» клавиши отправляются, только когда окно свёрнуто в трей.",
+                    "Кнопки контроллера нажимают клавиши Windows. Вход, назначенный на \
+                     клавишу, перестаёт работать как Xbox — конфликтов нет. При включённом \
+                     «Работать только в трее» клавиши отправляются, только когда окно \
+                     свёрнуто в трей.",
                 )
                 .size(11.0)
                 .color(MUTED),
             );
+            ui.add_space(4.0);
+            if ui
+                .button("Руль — джойстик, остальное — клавиатура")
+                .on_hover_text(
+                    "Оставить джойстиком только поворот руля (левый стик X), все остальные \
+                     назначения Xbox снять. Прежние назначения сохраняются в профиль.",
+                )
+                .clicked()
+            {
+                self.apply_wheel_keyboard_preset();
+            }
             ui.add_space(6.0);
 
             let profile = self.current_profile();
@@ -1595,6 +1885,26 @@ impl X360ceApp {
                                 .clicked()
                             {
                                 learn_input = Some(index);
+                            }
+                            if let InputBinding::AxisPositive { index: axis }
+                            | InputBinding::AxisNegative { index: axis } = next.input
+                            {
+                                let positive =
+                                    matches!(next.input, InputBinding::AxisPositive { .. });
+                                if ui
+                                    .selectable_label(!positive, "−")
+                                    .on_hover_text("Срабатывать, когда ось уходит в минус")
+                                    .clicked()
+                                {
+                                    next.input = InputBinding::AxisNegative { index: axis };
+                                }
+                                if ui
+                                    .selectable_label(positive, "+")
+                                    .on_hover_text("Срабатывать, когда ось уходит в плюс")
+                                    .clicked()
+                                {
+                                    next.input = InputBinding::AxisPositive { index: axis };
+                                }
                             }
                             egui::ComboBox::from_id_salt(("key-layer", index))
                                 .selected_text(Self::layer_name(next.modifier))
@@ -1658,6 +1968,18 @@ impl X360ceApp {
                                     }
                                 });
                         });
+                        let (controls, _) =
+                            conflicts_for(&profile, next.modifier, next.input, false, None, Some(index));
+                        if next.key.vk != 0 && !controls.is_empty() {
+                            ui.label(
+                                RichText::new(format!(
+                                    "Как Xbox этот вход отключён: {}",
+                                    conflict_names(&profile, &controls, &[])
+                                ))
+                                .size(10.0)
+                                .color(MUTED),
+                            );
+                        }
                     });
                 ui.add_space(4.0);
                 if next != *mapping {
@@ -2226,6 +2548,8 @@ fn ui_root(app: &mut X360ceApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                             app.render_raw_inputs(ui);
                         });
                         right[0].vertical(|ui| {
+                            app.render_profiles(ui);
+                            ui.add_space(8.0);
                             app.render_device_bar(ui);
                             ui.add_space(8.0);
                             app.render_mapping_editor(ui);
@@ -2657,14 +2981,73 @@ fn load_controller_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     ))
 }
 
+/// Назначения слоя `layer`, срабатывающие от того же физического входа.
+fn conflicts_for(
+    profile: &ControllerProfile,
+    layer: Option<usize>,
+    binding: InputBinding,
+    full: bool,
+    skip_control: Option<OutputControl>,
+    skip_key: Option<usize>,
+) -> (Vec<OutputControl>, Vec<usize>) {
+    let controls = profile
+        .layer_entries(layer)
+        .iter()
+        .filter(|entry| Some(entry.control) != skip_control)
+        .filter(|entry| inputs_overlap(binding, full, entry.binding, entry.uses_full_axis()))
+        .map(|entry| entry.control)
+        .collect();
+    let keys = profile
+        .keyboard
+        .iter()
+        .enumerate()
+        .filter(|(index, mapping)| {
+            Some(*index) != skip_key
+                && mapping.modifier == layer
+                && mapping.key.vk != 0
+                && inputs_overlap(binding, full, mapping.input, false)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    (controls, keys)
+}
+
+fn conflict_names(profile: &ControllerProfile, controls: &[OutputControl], keys: &[usize]) -> String {
+    controls
+        .iter()
+        .map(|control| compact_control_label(*control).to_owned())
+        .chain(keys.iter().filter_map(|index| {
+            profile
+                .keyboard
+                .get(*index)
+                .map(|mapping| format!("клавиша {}", mapping.key.label()))
+        }))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Назначения совпадают (имя и устройство не сравниваются).
+fn same_mappings(a: &ControllerProfile, b: &ControllerProfile) -> bool {
+    let strip = |profile: &ControllerProfile| {
+        let mut profile = profile.clone();
+        profile.device_guid.clear();
+        serde_json::to_value(profile).ok()
+    };
+    strip(a) == strip(b)
+}
+
 fn entry_label_for(profile: &ControllerProfile, control: OutputControl) -> String {
     profile
         .entry(control)
         .map(|entry| {
+            let mut label = entry.binding.label();
+            if control.is_trigger() && axis_binding_positive(entry.binding).is_some() {
+                label.push_str(if entry.centered_axis { " · половина" } else { " · вся ось" });
+            }
             if entry.trigger == TriggerType::Direct || entry.binding == InputBinding::None {
-                entry.binding.label()
+                label
             } else {
-                format!("{} · {}", entry.binding.label(), entry.trigger.label())
+                format!("{label} · {}", entry.trigger.label())
             }
         })
         .unwrap_or_else(|| "Не назначено".to_owned())

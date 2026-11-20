@@ -417,6 +417,11 @@ fn default_saturation() -> f32 {
 }
 
 impl MappingEntry {
+    /// Назначение читает всю ось (стик или триггер «на всю ось»), а не её половину.
+    pub fn uses_full_axis(&self) -> bool {
+        self.control.is_axis() || (self.control.is_trigger() && !self.centered_axis)
+    }
+
     pub fn new(control: OutputControl, binding: InputBinding) -> Self {
         Self {
             control,
@@ -591,6 +596,36 @@ impl ControllerProfile {
         }
     }
 
+    /// Приводит загруженный из файла профиль в рабочее состояние.
+    pub fn sanitize(&mut self) {
+        self.name = self.name.trim().to_owned();
+        self.modifiers.truncate(MAX_MODIFIERS);
+        let layers = self.modifiers.len();
+        self.keyboard
+            .retain(|mapping| mapping.modifier.is_none_or(|layer| layer < layers));
+        let mut seen = Vec::new();
+        self.entries.retain(|entry| {
+            let fresh = !seen.contains(&entry.control);
+            seen.push(entry.control);
+            fresh
+        });
+        // Газ и тормоз на противоположных половинах одной оси, но «на всю ось»:
+        // в покое оба триггера были бы нажаты наполовину. Это общая ось педалей.
+        let axis = |control| match self.entry(control).map(|entry| entry.binding) {
+            Some(InputBinding::AxisPositive { index }) => Some((index, false)),
+            Some(InputBinding::AxisNegative { index }) => Some((index, true)),
+            _ => Option::None,
+        };
+        if let (Some((left, left_negative)), Some((right, right_negative))) =
+            (axis(OutputControl::LeftTrigger), axis(OutputControl::RightTrigger))
+        {
+            if left == right && left_negative != right_negative {
+                self.entry_mut(OutputControl::LeftTrigger).centered_axis = true;
+                self.entry_mut(OutputControl::RightTrigger).centered_axis = true;
+            }
+        }
+    }
+
     /// Удаляет модификатор и сдвигает ссылки на последующие слои.
     pub fn remove_modifier(&mut self, index: usize) {
         if index >= self.modifiers.len() {
@@ -615,6 +650,33 @@ pub fn entry_mut_in(entries: &mut Vec<MappingEntry>, control: OutputControl) -> 
     }
     entries.push(MappingEntry::new(control, InputBinding::None));
     entries.last_mut().expect("mapping entry was inserted")
+}
+
+/// Одно физическое действие включает оба входа. `full_*` — назначение
+/// читает всю ось: тогда оно пересекается с любой половиной той же оси.
+/// Газ на «Ось 4 −» и тормоз на «Ось 4 +» (половины) не пересекаются.
+pub fn inputs_overlap(a: InputBinding, full_a: bool, b: InputBinding, full_b: bool) -> bool {
+    use InputBinding::*;
+    let axis = |binding| match binding {
+        AxisPositive { index } => Some((index, false)),
+        AxisNegative { index } => Some((index, true)),
+        _ => Option::None,
+    };
+    match (a, b) {
+        (None, _) | (_, None) => false,
+        (Hat { index: i, direction: x }, Hat { index: j, direction: y }) => {
+            let parts = |d: HatDirection| {
+                [HatDirection::Up, HatDirection::Right, HatDirection::Down, HatDirection::Left]
+                    .map(|cardinal| d.contains(cardinal))
+            };
+            let (x, y) = (parts(x), parts(y));
+            i == j && (0..4).any(|k| x[k] && y[k])
+        }
+        _ => match (axis(a), axis(b)) {
+            (Some((i, neg_a)), Some((j, neg_b))) => i == j && (full_a || full_b || neg_a == neg_b),
+            _ => a == b,
+        },
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -643,6 +705,27 @@ pub fn same_device(a: &str, b: &str) -> bool {
             .filter(|(vendor, _)| vendor != "0000")
     };
     matches!((ids(a), ids(b)), (Some(x), Some(y)) if x == y)
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn shared_pedal_axis_becomes_half_axes_and_bad_layers_are_dropped() {
+        let mut profile = ControllerProfile::default_for(String::new());
+        profile.entry_mut(OutputControl::RightTrigger).binding = InputBinding::AxisNegative { index: 3 };
+        profile.entry_mut(OutputControl::LeftTrigger).binding = InputBinding::AxisPositive { index: 3 };
+        profile.keyboard.push(KeyboardMapping { modifier: Some(2), ..Default::default() });
+        profile.sanitize();
+        assert!(profile.entry(OutputControl::RightTrigger).unwrap().centered_axis);
+        assert!(profile.entry(OutputControl::LeftTrigger).unwrap().centered_axis);
+        assert!(profile.keyboard.is_empty());
+        // Отдельные педали на разных осях не трогаем.
+        let mut separate = ControllerProfile::default_for(String::new());
+        separate.sanitize();
+        assert!(!separate.entry(OutputControl::LeftTrigger).unwrap().centered_axis);
+    }
 }
 
 #[cfg(test)]

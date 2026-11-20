@@ -1,6 +1,6 @@
 use crate::model::{
-    ControllerProfile, HatDirection, InputBinding, KeyOutput, MappingEntry, ModifierMode,
-    OutputControl, PressMode, RawState, TriggerType,
+    inputs_overlap, ControllerProfile, HatDirection, InputBinding, KeyOutput, MappingEntry,
+    ModifierMode, OutputControl, PressMode, RawState, TriggerType,
 };
 use std::time::{Duration, Instant};
 use vigem_rust::{X360Button, X360Report};
@@ -88,6 +88,7 @@ fn map_direct_report(
         profile.entry(control).filter(|entry| {
             !suppressed.contains(&entry.binding)
                 && (control.is_axis() || entry.trigger == TriggerType::Direct)
+                && !keyboard_owns(profile, None, entry)
         })
     };
 
@@ -192,7 +193,10 @@ fn rules_for(
 ) -> RuleSet {
     let mut rules = RuleSet::default();
     for entry in profile.layer_entries(layer) {
-        if entry.binding != binding || entry.control.is_axis() {
+        if entry.binding != binding
+            || entry.control.is_axis()
+            || keyboard_owns(profile, layer, entry)
+        {
             continue;
         }
         if layer.is_none() && entry.trigger == TriggerType::Direct && !with_base_direct {
@@ -206,6 +210,16 @@ fn rules_for(
         }
     }
     rules
+}
+
+/// Вход назначен на клавишу в этом слое — тогда назначение Xbox на тот же
+/// вход не работает: один вход либо джойстик, либо клавиатура, не оба сразу.
+pub fn keyboard_owns(profile: &ControllerProfile, layer: Option<usize>, entry: &MappingEntry) -> bool {
+    profile.keyboard.iter().any(|mapping| {
+        mapping.modifier == layer
+            && mapping.key.vk != 0
+            && inputs_overlap(mapping.input, false, entry.binding, entry.uses_full_axis())
+    })
 }
 
 /// Состояние одного отслеживаемого физического входа.
@@ -846,6 +860,52 @@ mod tests {
         assert!(trigger_preview(&entry, &raw) > 0.49);
     }
 
+    /// Газ и тормоз на одной оси: газ = «Ось 4 −», тормоз = «Ось 4 +».
+    #[test]
+    fn shared_pedal_axis_halves_do_not_conflict() {
+        let mut profile = ControllerProfile::default_for(String::new());
+        profile.entries.clear();
+        for (control, binding) in [
+            (OutputControl::RightTrigger, InputBinding::AxisNegative { index: 3 }),
+            (OutputControl::LeftTrigger, InputBinding::AxisPositive { index: 3 }),
+        ] {
+            let mut entry = MappingEntry::new(control, binding);
+            entry.centered_axis = true;
+            profile.entries.push(entry);
+        }
+        let at = |value: i16| {
+            let raw = RawState {
+                axes: vec![0, 0, 0, value],
+                ..Default::default()
+            };
+            let report = map_direct_report(&profile, &raw, &[]);
+            (report.right_trigger, report.left_trigger)
+        };
+        assert_eq!(at(0), (0, 0));
+        assert_eq!(at(-32_768), (255, 0));
+        assert_eq!(at(32_767), (0, 255));
+        // Сами назначения тоже считаются непересекающимися.
+        let (gas, brake) = (&profile.entries[0], &profile.entries[1]);
+        assert!(!inputs_overlap(gas.binding, gas.uses_full_axis(), brake.binding, brake.uses_full_axis()));
+        // А стик на всей оси пересекается с обеими половинами.
+        assert!(inputs_overlap(InputBinding::AxisPositive { index: 3 }, true, gas.binding, false));
+    }
+
+    #[test]
+    fn keyboard_mapping_disables_xbox_on_same_input() {
+        let mut profile = ControllerProfile::default_for(String::new());
+        profile.entries = vec![MappingEntry::new(OutputControl::A, TARGET)];
+        profile.keyboard = vec![keyboard(TARGET, None, TriggerType::Direct, key(0x45, PressMode::HoldWhilePressed))];
+        let mut state = MapperState::default();
+        let out = state.update(&profile, &buttons(&[1]), Instant::now());
+        assert!(!out.report.buttons.contains(X360Button::A));
+        assert_eq!(out.keys.len(), 1);
+        // Без клавиши кнопка снова работает как Xbox A.
+        profile.keyboard.clear();
+        let out = MapperState::default().update(&profile, &buttons(&[1]), Instant::now());
+        assert!(out.report.buttons.contains(X360Button::A));
+    }
+
     use crate::model::{KeyboardMapping, ModifierConfig};
 
     const MODIFIER: InputBinding = InputBinding::Button { index: 0 };
@@ -944,7 +1004,10 @@ mod tests {
             !out.report.buttons.contains(X360Button::A),
             "нет фантомного A"
         );
-        assert!(out.report.buttons.contains(X360Button::B));
+        assert!(
+            !out.report.buttons.contains(X360Button::B),
+            "вход назначен на клавишу — Xbox B в этом слое не срабатывает"
+        );
         assert_eq!(out.keys.len(), 1, "клавиша держится до отпускания кнопки");
 
         let out = state.update(&profile, &buttons(&[]), ms(t, 30));
