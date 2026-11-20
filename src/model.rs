@@ -62,6 +62,9 @@ pub struct RawState {
     /// Зажатые лепестки на общей с педалью оси: (индекс оси, отрицательное направление).
     #[serde(default)]
     pub paddles: Vec<(u32, bool)>,
+    /// Положение покоя каждой оси (из профиля); None — неизвестно.
+    #[serde(default)]
+    pub rest: Vec<Option<i16>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,8 +421,10 @@ fn default_saturation() -> f32 {
 
 impl MappingEntry {
     /// Назначение читает всю ось (стик или триггер «на всю ось»), а не её половину.
+    /// Триггеры и клавиши считают ход оси от покоя в одну сторону (половина),
+    /// стики — всю ось.
     pub fn uses_full_axis(&self) -> bool {
-        self.control.is_axis() || (self.control.is_trigger() && !self.centered_axis)
+        self.control.is_axis()
     }
 
     pub fn new(control: OutputControl, binding: InputBinding) -> Self {
@@ -486,6 +491,10 @@ pub struct ControllerProfile {
     pub timings: Timings,
     #[serde(default)]
     pub paddle_axes: Vec<PaddleAxis>,
+    /// Положение покоя осей (педали отпущены, руль по центру); запоминается
+    /// при назначении оси и кнопкой «Запомнить покой осей».
+    #[serde(default)]
+    pub axis_rest: Vec<Option<i16>>,
 }
 
 impl ControllerProfile {
@@ -573,6 +582,30 @@ impl ControllerProfile {
             keyboard: Vec::new(),
             timings: Timings::default(),
             paddle_axes: Vec::new(),
+            axis_rest: Vec::new(),
+        }
+    }
+
+    /// Запомнить покой только тех осей, для которых он ещё не известен.
+    pub fn fill_missing_rest(&mut self, axes: &[i16]) {
+        if self.axis_rest.len() < axes.len() {
+            self.axis_rest.resize(axes.len(), None);
+        }
+        for (rest, value) in self.axis_rest.iter_mut().zip(axes) {
+            rest.get_or_insert(*value);
+        }
+    }
+
+    /// Запомнить покой оси `index` из `baseline` (None — всех осей);
+    /// для неизвестных осей — тоже.
+    pub fn remember_rest(&mut self, baseline: &[i16], index: Option<usize>) {
+        if self.axis_rest.len() < baseline.len() {
+            self.axis_rest.resize(baseline.len(), None);
+        }
+        for (axis, value) in baseline.iter().enumerate() {
+            if self.axis_rest[axis].is_none() || Some(axis) == index || index.is_none() {
+                self.axis_rest[axis] = Some(*value);
+            }
         }
     }
 

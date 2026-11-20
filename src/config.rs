@@ -13,6 +13,7 @@ const DATA_ENV_VAR: &str = "X360CE_APP_DATA_DIR";
 const DATA_DIR_NAME: &str = ".x360ce-data";
 const CONFIG_FILE_NAME: &str = "config.json";
 const BACKUP_FILE_NAME: &str = "config.json.bak";
+const SETTINGS_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedState {
@@ -34,7 +35,7 @@ pub struct SavedState {
     pub startup_enabled: bool,
     #[serde(default)]
     pub include_prereleases: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub forward_only_in_tray: bool,
     #[serde(default = "default_true")]
     pub block_game_bar_controller_button: bool,
@@ -51,6 +52,12 @@ pub struct SavedState {
     /// Сохранённые именованные профили (не привязаны к устройству).
     #[serde(default)]
     pub library: Vec<ControllerProfile>,
+    /// Виртуальный Xbox-геймпад; выкл — контроллер работает только клавиатурой.
+    #[serde(default = "default_true")]
+    pub virtual_pad_enabled: bool,
+    /// Версия формата настроек (для разовых миграций).
+    #[serde(default)]
+    pub settings_version: u32,
 }
 
 impl Default for SavedState {
@@ -65,13 +72,15 @@ impl Default for SavedState {
             start_in_tray: false,
             startup_enabled: false,
             include_prereleases: false,
-            forward_only_in_tray: true,
+            forward_only_in_tray: false,
             block_game_bar_controller_button: true,
             last_auto_update_check_unix_seconds: 0,
             last_status: "Готово.".to_owned(),
             joycpl_on_start: false,
             joycpl_device_name: String::new(),
             library: Vec::new(),
+            virtual_pad_enabled: true,
+            settings_version: SETTINGS_VERSION,
         }
     }
 }
@@ -135,6 +144,13 @@ pub fn load_state() -> SavedState {
         data_dir.join(BACKUP_FILE_NAME),
     ] {
         if let Ok(mut state) = read_state_from_path(&path) {
+            if state.settings_version < 1 {
+                // До 0.4.1 вывод по умолчанию работал только в трее: при открытом
+                // окне контроллер «не работал». Теперь работает всегда.
+                state.forward_only_in_tray = false;
+                state.emulation_enabled = true;
+            }
+            state.settings_version = SETTINGS_VERSION;
             for profile in state.profiles.values_mut().chain(state.library.iter_mut()) {
                 profile.sanitize();
             }

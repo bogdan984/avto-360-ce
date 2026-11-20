@@ -7,7 +7,10 @@ use vigem_rust::{X360Button, X360Report};
 
 const LEARN_AXIS_DELTA_THRESHOLD: i32 = 7_500;
 const LEARN_AXIS_ABSOLUTE_THRESHOLD: i32 = 12_000;
-const BUTTON_AXIS_THRESHOLD: f32 = 0.55;
+/// Ось как кнопка/клавиша: нажата, когда прошла эту долю хода от покоя.
+const AXIS_PRESS_TRAVEL: f32 = 0.4;
+/// Если от покоя до края меньше этого, хода в эту сторону нет.
+const MIN_AXIS_SPAN: i32 = 4_000;
 
 pub fn detect_binding(previous: &RawState, current: &RawState) -> Option<InputBinding> {
     for (index, pressed) in current.buttons.iter().copied().enumerate() {
@@ -577,9 +580,11 @@ pub fn input_pressed(binding: InputBinding, raw: &RawState) -> bool {
     match binding {
         InputBinding::None => false,
         InputBinding::Button { index } => raw.buttons.get(index as usize).copied().unwrap_or(false),
-        InputBinding::AxisPositive { index } => normalized_axis(raw, index) > BUTTON_AXIS_THRESHOLD,
+        InputBinding::AxisPositive { index } => {
+            axis_travel(raw, index, false, 0) >= AXIS_PRESS_TRAVEL
+        }
         InputBinding::AxisNegative { index } => {
-            normalized_axis(raw, index) < -BUTTON_AXIS_THRESHOLD
+            axis_travel(raw, index, true, 0) >= AXIS_PRESS_TRAVEL
         }
         InputBinding::Hat { index, direction } => raw
             .hats
@@ -658,21 +663,13 @@ pub fn trigger_preview(entry: &MappingEntry, raw: &RawState) -> f32 {
                 0.0
             }
         }
+        // Покой неизвестен (старый профиль): «половина оси» — от центра,
+        // иначе — от противоположного края.
         InputBinding::AxisPositive { index } => {
-            let value = normalized_axis(raw, index);
-            if entry.centered_axis {
-                value.max(0.0)
-            } else {
-                ((value + 1.0) * 0.5).clamp(0.0, 1.0)
-            }
+            axis_travel(raw, index, false, if entry.centered_axis { 0 } else { i16::MIN })
         }
         InputBinding::AxisNegative { index } => {
-            let value = -normalized_axis(raw, index);
-            if entry.centered_axis {
-                value.max(0.0)
-            } else {
-                ((value + 1.0) * 0.5).clamp(0.0, 1.0)
-            }
+            axis_travel(raw, index, true, if entry.centered_axis { 0 } else { i16::MAX })
         }
         InputBinding::Hat { index, direction } => {
             if raw
@@ -699,6 +696,27 @@ fn trigger_value(entry: &MappingEntry, raw: &RawState) -> u8 {
     (trigger_preview(entry, raw) * 255.0)
         .round()
         .clamp(0.0, 255.0) as u8
+}
+
+/// Доля хода оси от положения покоя к краю `negative`/положительному:
+/// 0 — в покое или ушла в другую сторону, 1 — у края. Нет оси — 0.
+/// `fallback_rest` — покой, если он не запомнен в профиле.
+pub fn axis_travel(raw: &RawState, index: u32, negative: bool, fallback_rest: i16) -> f32 {
+    let Some(value) = raw.axes.get(index as usize).copied() else {
+        return 0.0;
+    };
+    let rest = raw
+        .rest
+        .get(index as usize)
+        .copied()
+        .flatten()
+        .unwrap_or(fallback_rest) as i32;
+    let end = if negative { i16::MIN as i32 } else { i16::MAX as i32 };
+    let span = end - rest;
+    if span.abs() < MIN_AXIS_SPAN {
+        return 0.0;
+    }
+    ((value as i32 - rest) as f32 / span as f32).clamp(0.0, 1.0)
 }
 
 fn normalized_axis(raw: &RawState, index: u32) -> f32 {
@@ -889,6 +907,68 @@ mod tests {
         assert!(!inputs_overlap(gas.binding, gas.uses_full_axis(), brake.binding, brake.uses_full_axis()));
         // А стик на всей оси пересекается с обеими половинами.
         assert!(inputs_overlap(InputBinding::AxisPositive { index: 3 }, true, gas.binding, false));
+    }
+
+    fn axes_at(axes: &[i16], rest: &[i16]) -> RawState {
+        RawState {
+            axes: axes.to_vec(),
+            rest: rest.iter().copied().map(Some).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Сценарий из жалобы: газ (ось 4 −) = W, тормоз (ось 4 +) = S, руль = ось 1.
+    #[test]
+    fn shared_pedal_axis_as_w_and_s_keys() {
+        let mut profile = ControllerProfile::default_for(String::new());
+        profile.entries.retain(|entry| entry.control == OutputControl::LeftStickX);
+        let hold = PressMode::HoldWhilePressed;
+        profile.keyboard = vec![
+            keyboard(InputBinding::AxisNegative { index: 3 }, None, TriggerType::Direct, key(0x57, hold)),
+            keyboard(InputBinding::AxisPositive { index: 3 }, None, TriggerType::Direct, key(0x53, hold)),
+        ];
+        let rest = [0, 0, 0, 0];
+        let mut state = MapperState::default();
+        let t = Instant::now();
+        let keys = |out: MapperOutput| out.keys.iter().map(|key| key.vk).collect::<Vec<_>>();
+
+        assert!(keys(state.update(&profile, &axes_at(&[0, 0, 0, 0], &rest), t)).is_empty());
+        let out = state.update(&profile, &axes_at(&[0, 0, 0, -20_000], &rest), ms(t, 10));
+        assert_eq!((out.report.left_trigger, out.report.right_trigger), (0, 0));
+        assert_eq!(keys(out), vec![0x57], "газ = только W");
+        let out = state.update(&profile, &axes_at(&[0, 0, 0, 0], &rest), ms(t, 20));
+        assert_eq!((out.report.left_trigger, out.report.right_trigger), (0, 0));
+        assert!(keys(out).is_empty(), "отпустили — ничего не зажато");
+        let out = state.update(&profile, &axes_at(&[0, 0, 0, 20_000], &rest), ms(t, 30));
+        assert_eq!(keys(out), vec![0x53], "тормоз = только S");
+        let out = state.update(&profile, &axes_at(&[12_000, 0, 0, 0], &rest), ms(t, 40));
+        assert!(out.report.thumb_lx > 0, "руль работает как стик");
+    }
+
+    /// Стандартные LT/RT на осях 5/6, которых у руля нет, не жмутся сами.
+    #[test]
+    fn default_triggers_stay_released_on_missing_or_centered_axes() {
+        let profile = ControllerProfile::default_for(String::new());
+        let report = map_direct_report(&profile, &axes_at(&[0, 0, 0, 0], &[]), &[]);
+        assert_eq!((report.left_trigger, report.right_trigger), (0, 0));
+        // Оси есть и в покое в центре: с запомненным покоем триггеры отпущены.
+        let rest = [0; 6];
+        let report = map_direct_report(&profile, &axes_at(&[0; 6], &rest), &[]);
+        assert_eq!((report.left_trigger, report.right_trigger), (0, 0));
+    }
+
+    /// Отдельные педали: в покое у края (обычная и перевёрнутая).
+    #[test]
+    fn separate_pedals_press_by_travel_from_rest() {
+        let normal = InputBinding::AxisPositive { index: 0 };
+        assert!(!input_pressed(normal, &axes_at(&[i16::MIN], &[i16::MIN])));
+        assert!(!input_pressed(normal, &axes_at(&[-20_000], &[i16::MIN])));
+        assert!(input_pressed(normal, &axes_at(&[0], &[i16::MIN])), "половина хода");
+        let inverted = InputBinding::AxisNegative { index: 0 };
+        assert!(!input_pressed(inverted, &axes_at(&[i16::MAX], &[i16::MAX])));
+        assert!(input_pressed(inverted, &axes_at(&[0], &[i16::MAX])));
+        // В другую сторону от покоя хода нет — никогда не нажата.
+        assert!(!input_pressed(InputBinding::AxisNegative { index: 0 }, &axes_at(&[i16::MIN], &[i16::MIN])));
     }
 
     #[test]

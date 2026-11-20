@@ -53,15 +53,27 @@ pub fn open(device_name: &str) -> Result<u32, String> {
     // диалог может оказаться в другом процессе, чем запущенный rundll32.
     // Первые 3 с — только точное совпадение имени, потом и нестрогое
     // (имя из SDL часто отличается от имени в списке joy.cpl).
+    // Новые окна joy.cpl уводим за экран сразу, ещё до поиска устройства.
+    let child_pid = child.id();
     let mut found = None;
-    for attempt in 0..150 {
-        found = find_device(&before, &needle, attempt >= 30);
+    for attempt in 0..300 {
+        hide_new_dialogs(&before, child_pid);
+        found = find_device(&before, &needle, attempt >= 60);
         if found.is_some() {
             break;
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(50));
     }
     let Some((main, list, index)) = found else {
+        // Закрываем то, что успело открыться, — иначе окно остаётся на экране.
+        let mut pids: Vec<u32> = new_dialogs(&before, child_pid)
+            .into_iter()
+            .map(window_pid)
+            .collect();
+        pids.dedup();
+        for pid in pids {
+            close(pid);
+        }
         let _ = child.kill();
         return Err(format!("«{device_name}» нет в списке игровых устройств"));
     };
@@ -118,7 +130,56 @@ pub fn open(device_name: &str) -> Result<u32, String> {
         close(dialog_pid);
         return Err("окно свойств не найдено".to_owned());
     }
+    // Окна могут сами вернуться в центр (перерисовка, смена DPI, Alt+Tab):
+    // пока процесс жив, держим все его окна за экраном.
+    thread::spawn(move || keep_away(dialog_pid));
     Ok(dialog_pid)
+}
+
+/// Новые (открытые после `before`) диалоги joy.cpl.
+fn new_dialogs(before: &[HWND], child_pid: u32) -> Vec<HWND> {
+    windows(None)
+        .into_iter()
+        .filter(|hwnd| {
+            !before.contains(hwnd)
+                && class_name(*hwnd) == "#32770"
+                && unsafe { IsWindowVisible(*hwnd) } != 0
+                && (window_pid(*hwnd) == child_pid || {
+                    let title = window_text(*hwnd).to_lowercase();
+                    title.contains("игровые устройства") || title.contains("game controllers")
+                })
+        })
+        .collect()
+}
+
+fn hide_new_dialogs(before: &[HWND], child_pid: u32) {
+    for hwnd in new_dialogs(before, child_pid) {
+        if !is_away(hwnd) {
+            away(hwnd);
+        }
+    }
+}
+
+/// Пока у процесса есть окна — возвращает их за край экрана.
+fn keep_away(pid: u32) {
+    let mut missing = 0;
+    while missing < 8 {
+        let own: Vec<HWND> = windows(None)
+            .into_iter()
+            .filter(|hwnd| window_pid(*hwnd) == pid && unsafe { IsWindowVisible(*hwnd) } != 0)
+            .collect();
+        if own.is_empty() {
+            missing += 1;
+        } else {
+            missing = 0;
+        }
+        for hwnd in own {
+            if !is_away(hwnd) {
+                away(hwnd);
+            }
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Закрыть joy.cpl: сначала мягко (WM_CLOSE через taskkill без /F —

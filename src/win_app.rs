@@ -4,7 +4,10 @@ use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, TextureHandle,
     TextureOptions,
 };
-use std::{env, ptr, thread, time::Duration};
+use std::{
+    env, ptr, thread,
+    time::{Duration, Instant},
+};
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon as TrayImage, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
@@ -230,6 +233,10 @@ struct X360ceApp {
     joycpl_rx: Option<Receiver<Result<u32, String>>>,
     /// Поле «Имя» в блоке профилей.
     profile_name_edit: String,
+    /// Автоопределение покоя осей: последние значения и с какого момента не менялись.
+    rest_probe: Option<(Vec<i16>, Instant)>,
+    /// После подключения оси уже менялись (контроллер прислал данные).
+    rest_activity: bool,
 }
 
 impl X360ceApp {
@@ -266,6 +273,7 @@ impl X360ceApp {
             initial_profile,
             state.emulation_enabled,
             forwarding_active,
+            state.virtual_pad_enabled,
         );
         let game_bar_result = game_bar::install_hard_block();
         let mut status = if state.last_status.is_empty() {
@@ -320,6 +328,8 @@ impl X360ceApp {
             joycpl_pid: None,
             joycpl_rx: Some(joycpl_rx),
             profile_name_edit,
+            rest_probe: None,
+            rest_activity: false,
         }
     }
 
@@ -409,6 +419,8 @@ impl X360ceApp {
         }
         self.state.selected_device_guid = guid.clone();
         self.profile_name_edit = self.current_profile_mut().name.clone();
+        self.rest_probe = None;
+        self.rest_activity = false;
         self.engine.send(EngineCommand::SelectDevice(guid));
         self.push_profile();
         self.status = "Контроллер выбран.".to_owned();
@@ -418,10 +430,11 @@ impl X360ceApp {
     fn set_emulation_enabled(&mut self, enabled: bool) {
         self.state.emulation_enabled = enabled;
         self.engine.send(EngineCommand::SetEnabled(enabled));
+        self.sync_forwarding_mode();
         self.status = if enabled {
-            "Виртуальный контроллер включён.".to_owned()
+            "Контроллер включён.".to_owned()
         } else {
-            "Виртуальный контроллер приостановлен.".to_owned()
+            "Контроллер выключен: ни клавиши, ни Xbox-геймпад не отправляются.".to_owned()
         };
         self.save();
         self.sync_tray();
@@ -457,6 +470,12 @@ impl X360ceApp {
         else {
             return;
         };
+        if let InputBinding::AxisPositive { index } | InputBinding::AxisNegative { index } = binding {
+            // Покой оси = значение в момент нажатия «Назначить» (педаль отпущена).
+            let baseline = self.learn_baseline.axes.clone();
+            self.current_profile_mut()
+                .remember_rest(&baseline, Some(index as usize));
+        }
 
         if let Some(index) = self.learning_modifier.take() {
             if let Some(modifier) = self.current_profile_mut().modifiers.get_mut(index) {
@@ -725,6 +744,18 @@ impl X360ceApp {
         format!(" Снято с конфликтующих: {names}.")
     }
 
+    /// Запомнить текущее положение всех осей как покой (педали отпущены).
+    fn calibrate_rest(&mut self) {
+        let axes = self.runtime.raw_state.axes.clone();
+        if axes.is_empty() {
+            self.status = "Контроллер не найден — нечего запоминать.".to_owned();
+            return;
+        }
+        self.current_profile_mut().remember_rest(&axes, None);
+        self.status = format!("Покой осей запомнен ({} осей).", axes.len());
+        self.profile_changed();
+    }
+
     /// «Руль — джойстик, остальное — клавиатура»: в основном слое остаётся
     /// только левый стик X (поворот руля), прежние назначения — в библиотеку.
     fn apply_wheel_keyboard_preset(&mut self) {
@@ -949,8 +980,50 @@ impl X360ceApp {
         }
     }
 
+    /// Если покой каких-то осей не известен — запоминаем его сами, когда оси
+    /// 1,5 с неподвижны. До первых данных SDL отдаёт нули — их не берём.
+    fn auto_detect_rest(&mut self) {
+        let axes = self.runtime.raw_state.axes.clone();
+        let learning = self.learning_control.is_some()
+            || self.learning_keyboard_input.is_some()
+            || self.learning_modifier.is_some();
+        let profile = self.current_profile();
+        let missing = (0..axes.len())
+            .any(|index| profile.axis_rest.get(index).copied().flatten().is_none());
+        if axes.is_empty() || learning || !missing {
+            self.rest_probe = None;
+            return;
+        }
+        let now = Instant::now();
+        let still = |previous: &[i16]| {
+            previous.len() == axes.len()
+                && previous
+                    .iter()
+                    .zip(&axes)
+                    .all(|(a, b)| (*a as i32 - *b as i32).abs() < 800)
+        };
+        match &self.rest_probe {
+            Some((previous, since)) if still(previous) => {
+                let has_data = self.rest_activity || axes.iter().any(|value| *value != 0);
+                if has_data && now.duration_since(*since) >= Duration::from_millis(1500) {
+                    self.current_profile_mut().fill_missing_rest(&axes);
+                    self.rest_probe = None;
+                    self.status = "Положение покоя осей определено автоматически.".to_owned();
+                    self.profile_changed();
+                }
+            }
+            previous => {
+                if previous.is_some() {
+                    self.rest_activity = true;
+                }
+                self.rest_probe = Some((axes, now));
+            }
+        }
+    }
+
     fn poll_runtime(&mut self) {
         self.runtime = self.engine.snapshot();
+        self.auto_detect_rest();
         let selected = self.state.selected_device_guid.clone();
         if self
             .runtime
@@ -1049,14 +1122,19 @@ impl X360ceApp {
     }
 
     fn render_status(&mut self, ui: &mut egui::Ui) {
-        let (label, color) = if !self.runtime.driver_installed {
-            ("нет драйвера", WARNING)
+        let pad = self.state.virtual_pad_enabled;
+        let (label, color) = if !self.state.emulation_enabled {
+            ("контроллер выключен", MUTED)
         } else if self.window_visible && self.state.forward_only_in_tray {
-            ("настройка", ACCENT)
+            ("пауза: окно открыто", WARNING)
+        } else if self.runtime.selected_instance_id.is_none() {
+            ("контроллер не найден", WARNING)
+        } else if !pad {
+            ("работает: клавиатура", SUCCESS)
+        } else if !self.runtime.driver_installed {
+            ("нет драйвера Xbox", WARNING)
         } else if self.runtime.virtual_connected {
             ("работает", SUCCESS)
-        } else if !self.state.emulation_enabled {
-            ("пауза", MUTED)
         } else {
             ("ожидание", WARNING)
         };
@@ -1065,18 +1143,24 @@ impl X360ceApp {
         compact_surface(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 status_chip(ui, label, color, true);
-                status_chip(
-                    ui,
-                    if self.window_visible && self.state.forward_only_in_tray {
-                        "вывод отключён"
-                    } else if self.state.emulation_enabled {
-                        "виртуальный вкл"
+                let mut pad_next = pad;
+                if ui
+                    .checkbox(&mut pad_next, "Xbox-геймпад")
+                    .on_hover_text(
+                        "Виртуальный Xbox 360 для руля/стиков/триггеров. Выключите, если \
+                         игра нужна только с клавиатуры — тогда она не увидит геймпад.",
+                    )
+                    .changed()
+                {
+                    self.state.virtual_pad_enabled = pad_next;
+                    self.engine.send(EngineCommand::SetVirtualPad(pad_next));
+                    self.status = if pad_next {
+                        "Виртуальный Xbox-геймпад включён.".to_owned()
                     } else {
-                        "виртуальный выкл"
-                    },
-                    ACCENT_SOFT,
-                    false,
-                );
+                        "Виртуальный Xbox-геймпад выключен — работают только клавиши.".to_owned()
+                    };
+                    self.save();
+                }
                 status_chip(
                     ui,
                     &format!("найдено: {}", self.runtime.devices.len()),
@@ -1096,7 +1180,7 @@ impl X360ceApp {
                 ui.label(RichText::new(&self.status).size(11.0).color(MUTED));
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if !self.runtime.driver_installed && ui.button("Установить драйвер").clicked()
+                    if pad && !self.runtime.driver_installed && ui.button("Установить драйвер").clicked()
                     {
                         match driver::launch_installer_elevated() {
                             Ok(_) => self.status =
@@ -1111,15 +1195,22 @@ impl X360ceApp {
                         self.engine.send(EngineCommand::Refresh);
                         self.status = "Обновление списка контроллеров…".to_owned();
                     }
-                    if ui
-                        .button(if self.state.emulation_enabled {
-                            "Выключить"
+                    let enabled = self.state.emulation_enabled;
+                    let toggle = egui::Button::new(
+                        RichText::new(if enabled {
+                            "Выключить контроллер"
                         } else {
-                            "Включить"
+                            "Включить контроллер"
                         })
-                        .clicked()
-                    {
-                        self.set_emulation_enabled(!self.state.emulation_enabled);
+                        .strong(),
+                    )
+                    .fill(if enabled { SURFACE_MUTED } else { SUCCESS });
+                    if ui.add(toggle).clicked() {
+                        if !enabled {
+                            // Включили — значит, должно работать сразу, даже с открытым окном.
+                            self.state.forward_only_in_tray = false;
+                        }
+                        self.set_emulation_enabled(!enabled);
                     }
                 });
             });
@@ -1497,15 +1588,11 @@ impl X360ceApp {
                     .as_ref()
                     .map(|entry| entry.binding)
                     .unwrap_or_default();
-                let centered = selected_entry
-                    .as_ref()
-                    .map(|entry| entry.centered_axis)
-                    .unwrap_or(false);
-                let mut set_centered = None;
+                let mut calibrate = false;
                 if control.is_trigger() {
                     if let Some(positive) = axis_binding_positive(binding) {
                         ui.label(
-                            RichText::new("Срабатывает, когда ось уходит")
+                            RichText::new("Срабатывает, когда ось уходит от покоя")
                                 .size(11.0)
                                 .color(MUTED),
                         );
@@ -1517,29 +1604,7 @@ impl X360ceApp {
                                 self.set_axis_binding_direction(control, true);
                             }
                         });
-                        ui.horizontal(|ui| {
-                            if ui
-                                .selectable_label(centered, "Половина оси")
-                                .on_hover_text(
-                                    "Газ и тормоз на одной оси: в покое ось в центре, \
-                                     одна педаль ведёт её в минус, другая в плюс. \
-                                     Назначьте одной педали «в минус», другой «в плюс».",
-                                )
-                                .clicked()
-                            {
-                                set_centered = Some(true);
-                            }
-                            if ui
-                                .selectable_label(!centered, "Вся ось")
-                                .on_hover_text(
-                                    "Отдельная педаль: в покое ось в одном крае, \
-                                     нажатие ведёт её в другой край.",
-                                )
-                                .clicked()
-                            {
-                                set_centered = Some(false);
-                            }
-                        });
+                        calibrate = rest_row(ui, &self.runtime.raw_state, binding);
                     }
                 } else {
                     if let Some(positive) = axis_binding_positive(binding) {
@@ -1564,10 +1629,6 @@ impl X360ceApp {
                     let mapping = self.edit_entry_mut(control);
                     ui.horizontal_wrapped(|ui| {
                         changed |= ui.checkbox(&mut mapping.invert, "Инвертировать").changed();
-                        if let Some(centered) = set_centered {
-                            mapping.centered_axis = centered;
-                            changed = true;
-                        }
                     });
                     changed |= ui
                         .add(
@@ -1587,6 +1648,9 @@ impl X360ceApp {
                 if changed {
                     self.push_profile();
                     self.save();
+                }
+                if calibrate {
+                    self.calibrate_rest();
                 }
             }
 
@@ -1849,6 +1913,16 @@ impl X360ceApp {
             {
                 self.apply_wheel_keyboard_preset();
             }
+            if ui
+                .button("Запомнить покой осей")
+                .on_hover_text(
+                    "Отпустите педали и лепестки, руль — по центру, и нажмите. Педали \
+                     срабатывают по ходу от этого положения (запоминается и само при назначении).",
+                )
+                .clicked()
+            {
+                self.calibrate_rest();
+            }
             ui.add_space(6.0);
 
             let profile = self.current_profile();
@@ -1905,6 +1979,18 @@ impl X360ceApp {
                                 {
                                     next.input = InputBinding::AxisPositive { index: axis };
                                 }
+                                let travel = mapper::axis_travel(
+                                    &self.runtime.raw_state,
+                                    axis,
+                                    !positive,
+                                    0,
+                                );
+                                ui.label(
+                                    RichText::new(format!("ход {:.0}%", travel * 100.0))
+                                        .size(10.0)
+                                        .color(MUTED),
+                                )
+                                .on_hover_text("Клавиша нажимается от 40% хода от покоя");
                             }
                             egui::ComboBox::from_id_salt(("key-layer", index))
                                 .selected_text(Self::layer_name(next.modifier))
@@ -2981,6 +3067,43 @@ fn load_controller_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     ))
 }
 
+/// Строка «покой оси / сейчас» для оси назначения. true — нажали «Запомнить».
+fn rest_row(ui: &mut egui::Ui, raw: &RawState, binding: InputBinding) -> bool {
+    let (InputBinding::AxisPositive { index } | InputBinding::AxisNegative { index }) = binding
+    else {
+        return false;
+    };
+    let percent = |value: i16| (value as f32 / 327.67).round() as i32;
+    let rest = raw.rest.get(index as usize).copied().flatten();
+    let now = raw.axes.get(index as usize).copied();
+    let travel = mapper::axis_travel(
+        raw,
+        index,
+        matches!(binding, InputBinding::AxisNegative { .. }),
+        0,
+    );
+    let mut clicked = false;
+    ui.horizontal_wrapped(|ui| {
+        let text = match (rest, now) {
+            (Some(rest), Some(now)) => format!(
+                "Ось {}: покой {}%, сейчас {}%, нажато {}%",
+                index + 1,
+                percent(rest),
+                percent(now),
+                (travel * 100.0).round()
+            ),
+            (None, _) => format!("Ось {}: покой не запомнен", index + 1),
+            (_, None) => format!("Ось {}: нет у контроллера", index + 1),
+        };
+        ui.label(RichText::new(text).size(11.0).color(if rest.is_some() { MUTED } else { WARNING }));
+        clicked = ui
+            .small_button("Запомнить покой")
+            .on_hover_text("Отпустите педали и нажмите")
+            .clicked();
+    });
+    clicked
+}
+
 /// Назначения слоя `layer`, срабатывающие от того же физического входа.
 fn conflicts_for(
     profile: &ControllerProfile,
@@ -3040,10 +3163,7 @@ fn entry_label_for(profile: &ControllerProfile, control: OutputControl) -> Strin
     profile
         .entry(control)
         .map(|entry| {
-            let mut label = entry.binding.label();
-            if control.is_trigger() && axis_binding_positive(entry.binding).is_some() {
-                label.push_str(if entry.centered_axis { " · половина" } else { " · вся ось" });
-            }
+            let label = entry.binding.label();
             if entry.trigger == TriggerType::Direct || entry.binding == InputBinding::None {
                 label
             } else {

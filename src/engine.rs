@@ -23,6 +23,8 @@ pub enum EngineCommand {
     SetProfile(ControllerProfile),
     SetEnabled(bool),
     SetForwardingActive(bool),
+    /// Подключать виртуальный Xbox-геймпад (выкл — только клавиатура).
+    SetVirtualPad(bool),
     Refresh,
     Shutdown,
 }
@@ -39,6 +41,7 @@ impl ControllerEngine {
         profile: ControllerProfile,
         enabled: bool,
         forwarding_active: bool,
+        virtual_pad: bool,
     ) -> Self {
         let (commands, receiver) = unbounded();
         let snapshot = Arc::new(RwLock::new(RuntimeSnapshot {
@@ -56,6 +59,7 @@ impl ControllerEngine {
                     profile,
                     enabled,
                     forwarding_active,
+                    virtual_pad,
                 ) {
                     update_snapshot(&worker_snapshot, |state| {
                         state.last_error =
@@ -113,6 +117,7 @@ fn run_worker(
     mut profile: ControllerProfile,
     mut enabled: bool,
     mut forwarding_active: bool,
+    mut virtual_pad: bool,
 ) -> anyhow::Result<()> {
     sdl2::hint::set("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
     sdl2::hint::set("SDL_JOYSTICK_THREAD", "1");
@@ -164,6 +169,12 @@ fn run_worker(
                     next_virtual_connect_attempt = Instant::now();
                     last_virtual_error = None;
                 }
+                EngineCommand::SetVirtualPad(next) => {
+                    virtual_pad = next;
+                    virtual_gamepad = None;
+                    next_virtual_connect_attempt = Instant::now();
+                    last_virtual_error = None;
+                }
                 EngineCommand::Refresh => force_refresh = true,
                 EngineCommand::Shutdown => {
                     keyboard.release_all();
@@ -196,6 +207,7 @@ fn run_worker(
             .filter(|device| device.attached())
             .map(read_raw_state)
             .unwrap_or_default();
+        raw.rest = profile.axis_rest.clone();
         paddle_filter.apply(&profile.paddle_axes, &mut raw, Instant::now());
         let active = has_activity(&previous_raw, &raw);
         if active {
@@ -217,7 +229,7 @@ fn run_worker(
                 .unwrap_or(&[]),
         );
 
-        if let (Some(output), true) = (&output, driver_installed) {
+        if let (Some(output), true) = (&output, driver_installed && virtual_pad) {
             if virtual_gamepad.is_none() && Instant::now() >= next_virtual_connect_attempt {
                 match VirtualGamepad::connect() {
                     Ok(gamepad) => {
@@ -239,7 +251,7 @@ fn run_worker(
             }
         } else {
             virtual_gamepad = None;
-            last_virtual_error = if forwarding && !driver_installed {
+            last_virtual_error = if forwarding && virtual_pad && !driver_installed {
                 Some("Драйвер ViGEmBus не установлен.".to_owned())
             } else {
                 None
@@ -336,6 +348,7 @@ fn read_raw_state(joystick: &sdl2::joystick::Joystick) -> RawState {
         buttons,
         hats,
         paddles: Vec::new(),
+        rest: Vec::new(),
     }
 }
 
