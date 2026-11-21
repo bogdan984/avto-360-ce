@@ -264,7 +264,7 @@ impl X360ceApp {
                     ControllerProfile::default_for(state.selected_device_guid.clone())
                 })
         };
-        let profile_name_edit = initial_profile.name.clone();
+        let profile_name_edit = state.active_profile().name;
         // Guide output is intentionally always blocked. Keep persisted state
         // aligned with actual behavior and Windows registry policy.
         state.block_game_bar_controller_button = true;
@@ -781,27 +781,35 @@ impl X360ceApp {
         self.profile_changed();
     }
 
-    fn upsert_library(&mut self, mut profile: ControllerProfile) {
-        profile.device_guid.clear();
-        match self.state.library.iter_mut().find(|saved| saved.name == profile.name) {
-            Some(slot) => *slot = profile,
-            None => self.state.library.push(profile),
-        }
-        self.state
-            .library
-            .sort_by_key(|saved| saved.name.to_lowercase());
+    fn upsert_library(&mut self, profile: ControllerProfile) {
+        self.state.upsert_library(profile);
     }
 
     /// Делает профиль активным для выбранного контроллера.
-    fn activate_profile(&mut self, mut profile: ControllerProfile) {
-        let guid = self.state.selected_device_guid.clone();
-        profile.device_guid = guid.clone();
+    fn activate_profile(&mut self, profile: ControllerProfile) {
         self.profile_name_edit = profile.name.clone();
-        self.state.profiles.insert(guid, profile);
+        self.state.activate(profile);
         self.edit_layer = None;
         self.cancel_learning();
         self.selected_axis_negative = None;
         self.push_profile();
+    }
+
+    /// Новый пустой профиль с именем из поля (или «Новый профиль N»), сразу активный.
+    fn create_new_profile(&mut self) {
+        let typed = self.profile_name_edit.trim().to_owned();
+        let name = if typed.is_empty() || typed == self.current_profile().name {
+            self.state.free_library_name("Новый профиль")
+        } else if self.state.library.iter().any(|saved| saved.name == typed) {
+            self.status = format!("Профиль «{typed}» уже есть — введите другое имя.");
+            return;
+        } else {
+            typed
+        };
+        let profile = self.state.new_empty_profile(name.clone());
+        self.activate_profile(profile);
+        self.status = format!("Создан пустой профиль «{name}» — назначьте кнопки.");
+        self.save();
     }
 
     fn save_profile_to_library(&mut self) {
@@ -1288,8 +1296,18 @@ impl X360ceApp {
                         .desired_width(200.0),
                 );
                 if ui
+                    .button("Новый")
+                    .on_hover_text("Создать пустой профиль с этим именем и переключиться на него")
+                    .clicked()
+                {
+                    self.create_new_profile();
+                }
+                if ui
                     .button("Сохранить")
-                    .on_hover_text("Сохранить текущие назначения под этим именем (перезапишет одноимённый)")
+                    .on_hover_text(
+                        "Сохранить текущие назначения под этим именем \
+                         (новое имя — копия текущего профиля)",
+                    )
                     .clicked()
                 {
                     self.save_profile_to_library();

@@ -97,6 +97,47 @@ impl SavedState {
         }
     }
 
+    /// Добавляет профиль в список или заменяет одноимённый.
+    pub fn upsert_library(&mut self, profile: ControllerProfile) {
+        let profile = ControllerProfile {
+            device_guid: String::new(),
+            ..profile
+        };
+        match self.library.iter_mut().find(|saved| saved.name == profile.name) {
+            Some(slot) => *slot = profile,
+            None => self.library.push(profile),
+        }
+        self.library.sort_by_key(|saved| saved.name.to_lowercase());
+    }
+
+    /// Профиль выбранного контроллера (или стандартный, если его ещё нет).
+    pub fn active_profile(&self) -> ControllerProfile {
+        self.profiles
+            .get(&self.selected_device_guid)
+            .cloned()
+            .unwrap_or_else(|| ControllerProfile::default_for(self.selected_device_guid.clone()))
+    }
+
+    /// Делает профиль активным для выбранного контроллера. Прежний активный
+    /// профиль остаётся в списке, чтобы его настройки не потерялись.
+    pub fn activate(&mut self, mut profile: ControllerProfile) {
+        let current = self.active_profile();
+        if !self.library.iter().any(|saved| saved.name == current.name) {
+            self.upsert_library(current);
+        }
+        let guid = self.selected_device_guid.clone();
+        profile.device_guid = guid.clone();
+        self.profiles.insert(guid, profile);
+    }
+
+    /// Пустой профиль в списке; покой осей берётся от текущего (это свойство руля).
+    pub fn new_empty_profile(&mut self, name: String) -> ControllerProfile {
+        let mut profile = ControllerProfile::empty(name, String::new());
+        profile.axis_rest = self.active_profile().axis_rest;
+        self.upsert_library(profile.clone());
+        profile
+    }
+
     /// Свободное имя в списке: `base`, иначе `base (2)`, `base (3)`, …
     pub fn free_library_name(&self, base: &str) -> String {
         let taken = |name: &str| self.library.iter().any(|saved| saved.name == name);
@@ -302,6 +343,67 @@ mod tests {
 
         state.sync_library(&named("Нет в списке"));
         assert_eq!(state.library.len(), 2);
+    }
+
+    /// Сценарий пользователя: профиль 1 настроен, создаём профиль 2 —
+    /// в нём ничего из профиля 1; переключения показывают каждый своё.
+    #[test]
+    fn new_profile_is_empty_and_switching_shows_own_settings() {
+        use crate::model::{KeyboardMapping, ModifierConfig, PaddleAxis};
+        let json = |profile: &ControllerProfile| {
+            let mut profile = profile.clone();
+            profile.device_guid.clear();
+            serde_json::to_string(&profile).unwrap()
+        };
+        let mut state = SavedState {
+            selected_device_guid: "wheel".to_owned(),
+            ..SavedState::default()
+        };
+        let mut first = ControllerProfile::empty("Профиль 1".to_owned(), String::new());
+        first.entry_mut(OutputControl::A).binding = InputBinding::Button { index: 7 };
+        first.entry_mut(OutputControl::LeftStickX).binding = InputBinding::AxisPositive { index: 0 };
+        first.modifiers.push(ModifierConfig::default());
+        first.keyboard.push(KeyboardMapping::default());
+        first.paddle_axes.push(PaddleAxis::new(3));
+        first.axis_rest = vec![Some(0), Some(-32768)];
+        state.profiles.insert("wheel".to_owned(), first.clone());
+
+        // «Новый»: профиль 1 (ещё не в списке) не теряется, профиль 2 пустой.
+        let second = state.new_empty_profile("Профиль 2".to_owned());
+        state.activate(second);
+        let active = state.active_profile();
+        assert_eq!(active.name, "Профиль 2");
+        assert!(active.entries.iter().all(|entry| entry.binding == InputBinding::None));
+        assert!(active.modifiers.is_empty() && active.keyboard.is_empty());
+        assert!(active.paddle_axes.is_empty());
+        assert_eq!(active.axis_rest, first.axis_rest);
+        assert_eq!(state.library.len(), 2);
+
+        // Настраиваем профиль 2 (как profile_changed в окне).
+        let mut edited = state.active_profile();
+        edited.entry_mut(OutputControl::B).binding = InputBinding::Button { index: 2 };
+        state.profiles.insert("wheel".to_owned(), edited.clone());
+        state.sync_library(&edited);
+
+        // Обратно на профиль 1 — только его настройки.
+        let saved_first = state.library.iter().find(|p| p.name == "Профиль 1").cloned().unwrap();
+        state.activate(saved_first);
+        assert_eq!(json(&state.active_profile()), json(&first));
+
+        // Снова профиль 2 — его настройки, без кнопок профиля 1.
+        let saved_second = state.library.iter().find(|p| p.name == "Профиль 2").cloned().unwrap();
+        state.activate(saved_second);
+        let active = state.active_profile();
+        assert_eq!(json(&active), json(&edited));
+        assert_eq!(active.entry(OutputControl::A).unwrap().binding, InputBinding::None);
+        assert!(active.modifiers.is_empty());
+
+        // Третий профиль тоже пустой, имена не путаются.
+        let third = state.new_empty_profile(state.free_library_name("Новый профиль"));
+        assert_eq!(third.name, "Новый профиль");
+        state.activate(third);
+        assert!(state.active_profile().entries.iter().all(|e| e.binding == InputBinding::None));
+        assert_eq!(state.library.len(), 3);
     }
 
     #[test]

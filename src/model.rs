@@ -617,6 +617,16 @@ impl ControllerProfile {
         }
     }
 
+    /// Чистый профиль: ни одного назначения, модификатора, клавиши и лепестка.
+    pub fn empty(name: String, device_guid: String) -> Self {
+        let mut profile = Self::default_for(device_guid);
+        profile.name = name;
+        for entry in &mut profile.entries {
+            entry.binding = InputBinding::None;
+        }
+        profile
+    }
+
     pub fn entry(&self, control: OutputControl) -> Option<&MappingEntry> {
         self.entries.iter().find(|entry| entry.control == control)
     }
