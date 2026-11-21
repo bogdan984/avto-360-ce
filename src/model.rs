@@ -282,6 +282,9 @@ impl ModifierMode {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ModifierConfig {
+    /// Имя, заданное пользователем; пустое — «Модификатор N».
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub binding: InputBinding,
     #[serde(default)]
@@ -347,6 +350,9 @@ pub struct KeyboardMapping {
     pub trigger: TriggerType,
     #[serde(default)]
     pub key: KeyOutput,
+    /// Название действия, заданное пользователем (например «Шасси»).
+    #[serde(default)]
+    pub action: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -776,5 +782,23 @@ mod same_device_tests {
             "05000000000000000000000000000000",
             "05000000000000000000000000000001"
         ));
+    }
+}
+
+#[cfg(test)]
+mod names_tests {
+    use super::*;
+
+    #[test]
+    fn old_profiles_without_names_still_load_and_names_round_trip() {
+        let old: ModifierConfig = serde_json::from_str(r#"{"mode":"layer-only"}"#).unwrap();
+        assert!(old.name.is_empty());
+        let old: KeyboardMapping = serde_json::from_str(r#"{"modifier":1}"#).unwrap();
+        assert!(old.action.is_empty());
+
+        let mapping = KeyboardMapping { action: "Шасси".to_owned(), ..Default::default() };
+        let back: KeyboardMapping =
+            serde_json::from_str(&serde_json::to_string(&mapping).unwrap()).unwrap();
+        assert_eq!(back.action, "Шасси");
     }
 }

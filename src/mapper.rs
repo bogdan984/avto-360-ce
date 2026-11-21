@@ -1017,6 +1017,7 @@ mod tests {
             modifier,
             trigger,
             key,
+            ..Default::default()
         }
     }
 
@@ -1029,6 +1030,7 @@ mod tests {
             binding: MODIFIER,
             mode,
             entries: vec![MappingEntry::new(OutputControl::B, TARGET)],
+            ..Default::default()
         }];
         profile
     }

@@ -54,6 +54,8 @@ const MUTED: Color32 = Color32::from_rgb(102, 108, 120);
 const ACCENT: Color32 = Color32::from_rgb(52, 111, 224);
 const ACCENT_SOFT: Color32 = Color32::from_rgb(224, 234, 255);
 const SUCCESS: Color32 = Color32::from_rgb(37, 145, 83);
+/// Кружок «сейчас нажато» возле назначенного входа.
+const ACTIVE_DOT: Color32 = Color32::from_rgb(40, 200, 80);
 const WARNING: Color32 = Color32::from_rgb(205, 125, 21);
 const DANGER: Color32 = Color32::from_rgb(199, 58, 58);
 const CONTROLLER: Color32 = Color32::from_rgb(43, 47, 56);
@@ -351,10 +353,13 @@ impl X360ceApp {
         }
     }
 
-    fn layer_name(layer: Option<usize>) -> String {
+    fn layer_name(profile: &ControllerProfile, layer: Option<usize>) -> String {
         match layer {
             None => "Основной".to_owned(),
-            Some(index) => format!("Модификатор {}", index + 1),
+            Some(index) => match profile.modifiers.get(index).map(|m| m.name.trim()) {
+                Some(name) if !name.is_empty() => name.to_owned(),
+                _ => format!("Модификатор {}", index + 1),
+            },
         }
     }
 
@@ -819,6 +824,26 @@ impl X360ceApp {
         self.profile_changed();
     }
 
+    fn rename_profile(&mut self) {
+        let old = self.current_profile().name;
+        let new = self.profile_name_edit.trim().to_owned();
+        if new.is_empty() || new == old || self.state.library.iter().any(|saved| saved.name == new) {
+            return;
+        }
+        for saved in self.state.library.iter_mut().filter(|saved| saved.name == old) {
+            saved.name = new.clone();
+        }
+        self.state
+            .library
+            .sort_by_key(|saved| saved.name.to_lowercase());
+        for profile in self.state.profiles.values_mut().filter(|profile| profile.name == old) {
+            profile.name = new.clone();
+        }
+        self.profile_name_edit = new.clone();
+        self.status = format!("Профиль «{old}» переименован в «{new}».");
+        self.profile_changed();
+    }
+
     fn load_library_profile(&mut self, name: &str) {
         let Some(profile) = self.state.library.iter().find(|saved| saved.name == name).cloned()
         else {
@@ -1257,6 +1282,17 @@ impl X360ceApp {
                 {
                     self.save_profile_to_library();
                 }
+                let new_name = self.profile_name_edit.trim().to_owned();
+                let can_rename = !new_name.is_empty()
+                    && new_name != active.name
+                    && !self.state.library.iter().any(|saved| saved.name == new_name);
+                if ui
+                    .add_enabled(can_rename, egui::Button::new("Переименовать"))
+                    .on_hover_text("Дать текущему профилю новое имя (без создания копии)")
+                    .clicked()
+                {
+                    self.rename_profile();
+                }
             });
             let names: Vec<String> = self.state.library.iter().map(|saved| saved.name.clone()).collect();
             let mut load = None;
@@ -1463,7 +1499,7 @@ impl X360ceApp {
             let profile = self.edit_view();
             let selected_entry = profile.entry(control).cloned();
             ui.label(
-                RichText::new(format!("Слой: {}", Self::layer_name(self.edit_layer)))
+                RichText::new(format!("Слой: {}", Self::layer_name(&self.current_profile(), self.edit_layer)))
                     .size(11.0)
                     .color(ACCENT),
             );
@@ -1712,6 +1748,7 @@ impl X360ceApp {
                             let response = ui
                                 .horizontal(|ui| {
                                     // Подпись фиксированной ширины — все «×» на одной вертикали.
+                                    activity_dot(ui, active && mapped);
                                     let label_width = (ui.available_width() - 30.0).max(110.0);
                                     let response = ui
                                         .allocate_ui_with_layout(
@@ -1771,7 +1808,7 @@ impl X360ceApp {
                 let layers = std::iter::once(None).chain((0..profile.modifiers.len()).map(Some));
                 for layer in layers {
                     if ui
-                        .selectable_label(self.edit_layer == layer, Self::layer_name(layer))
+                        .selectable_label(self.edit_layer == layer, Self::layer_name(&profile, layer))
                         .clicked()
                     {
                         self.edit_layer = layer;
@@ -1784,10 +1821,22 @@ impl X360ceApp {
             let mut remove = None;
             let mut learn = None;
             let mut new_mode = None;
+            let mut new_name = None;
             for (index, modifier) in profile.modifiers.iter().enumerate() {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("Модификатор {}:", index + 1)).strong());
+                    ui.label(RichText::new(format!("{}.", index + 1)).strong());
+                    let mut name = modifier.name.clone();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut name)
+                            .hint_text(format!("Модификатор {}", index + 1))
+                            .desired_width(130.0),
+                    )
+                    .on_hover_text("Имя модификатора");
+                    if name != modifier.name {
+                        new_name = Some((index, name));
+                    }
                     let held = mapper::input_pressed(modifier.binding, &self.runtime.raw_state);
+                    activity_dot(ui, held && modifier.binding != InputBinding::None);
                     let text = if self.learning_modifier == Some(index) {
                         RichText::new("нажмите кнопку…").color(ACCENT)
                     } else if modifier.binding == InputBinding::None {
@@ -1826,6 +1875,10 @@ impl X360ceApp {
             }
             if let Some(index) = learn {
                 self.begin_learning_input(Some(index), None);
+            }
+            if let Some((index, name)) = new_name {
+                self.current_profile_mut().modifiers[index].name = name;
+                self.profile_changed();
             }
             if let Some((index, mode)) = new_mode {
                 self.current_profile_mut().modifiers[index].mode = mode;
@@ -1933,144 +1986,169 @@ impl X360ceApp {
             let mut remove = None;
             let mut learn_input = None;
             let mut learn_key = None;
-            for (index, mapping) in profile.keyboard.iter().enumerate() {
-                let mut next = mapping.clone();
-                egui::Frame::new()
-                    .fill(SURFACE_MUTED)
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new(format!("{}.", index + 1)).strong());
-                            let input = if self.learning_keyboard_input == Some(index) {
-                                "нажмите кнопку…".to_owned()
-                            } else {
-                                next.input.label()
-                            };
-                            let active = mapper::input_pressed(next.input, &self.runtime.raw_state);
-                            let input = if active {
-                                RichText::new(input).strong().color(SUCCESS)
-                            } else {
-                                RichText::new(input)
-                            };
-                            if ui
-                                .button(input)
-                                .on_hover_text("Назначить кнопку контроллера")
-                                .clicked()
-                            {
-                                learn_input = Some(index);
-                            }
-                            if let InputBinding::AxisPositive { index: axis }
-                            | InputBinding::AxisNegative { index: axis } = next.input
-                            {
-                                let positive =
-                                    matches!(next.input, InputBinding::AxisPositive { .. });
-                                if ui
-                                    .selectable_label(!positive, "−")
-                                    .on_hover_text("Срабатывать, когда ось уходит в минус")
-                                    .clicked()
-                                {
-                                    next.input = InputBinding::AxisNegative { index: axis };
-                                }
-                                if ui
-                                    .selectable_label(positive, "+")
-                                    .on_hover_text("Срабатывать, когда ось уходит в плюс")
-                                    .clicked()
-                                {
-                                    next.input = InputBinding::AxisPositive { index: axis };
-                                }
-                                let travel = mapper::axis_travel(
-                                    &self.runtime.raw_state,
-                                    axis,
-                                    !positive,
-                                    0,
-                                );
-                                ui.label(
-                                    RichText::new(format!("ход {:.0}%", travel * 100.0))
+            let mut add_to = None;
+            // Каждый слой — своя колонка: одна и та же кнопка в разных
+            // модификаторах видна рядом, у каждого слоя — свой список.
+            let per_row = layers.len().min(3);
+            for row in layers.chunks(per_row) {
+                ui.columns(per_row, |columns| {
+                    for (column, layer) in row.iter().enumerate() {
+                        let ui = &mut columns[column];
+                        ui.label(
+                            RichText::new(Self::layer_name(&profile, *layer))
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        let mappings = profile
+                            .keyboard
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, mapping)| mapping.modifier == *layer);
+                        for (number, (index, mapping)) in mappings.enumerate() {
+                            let mut next = mapping.clone();
+                        egui::Frame::new()
+                            .fill(SURFACE_MUTED)
+                            .corner_radius(8)
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(format!("{}.", number + 1)).strong());
+                                    let input = if self.learning_keyboard_input == Some(index) {
+                                        "нажмите кнопку…".to_owned()
+                                    } else {
+                                        next.input.label()
+                                    };
+                                    let active = mapper::input_pressed(next.input, &self.runtime.raw_state);
+                                    let input = if active {
+                                        RichText::new(input).strong().color(SUCCESS)
+                                    } else {
+                                        RichText::new(input)
+                                    };
+                                    activity_dot(ui, active && next.input != InputBinding::None);
+                                    if ui
+                                        .button(input)
+                                        .on_hover_text("Назначить кнопку контроллера")
+                                        .clicked()
+                                    {
+                                        learn_input = Some(index);
+                                    }
+                                    if let InputBinding::AxisPositive { index: axis }
+                                    | InputBinding::AxisNegative { index: axis } = next.input
+                                    {
+                                        let positive =
+                                            matches!(next.input, InputBinding::AxisPositive { .. });
+                                        if ui
+                                            .selectable_label(!positive, "−")
+                                            .on_hover_text("Срабатывать, когда ось уходит в минус")
+                                            .clicked()
+                                        {
+                                            next.input = InputBinding::AxisNegative { index: axis };
+                                        }
+                                        if ui
+                                            .selectable_label(positive, "+")
+                                            .on_hover_text("Срабатывать, когда ось уходит в плюс")
+                                            .clicked()
+                                        {
+                                            next.input = InputBinding::AxisPositive { index: axis };
+                                        }
+                                        let travel = mapper::axis_travel(
+                                            &self.runtime.raw_state,
+                                            axis,
+                                            !positive,
+                                            0,
+                                        );
+                                        ui.label(
+                                            RichText::new(format!("ход {:.0}%", travel * 100.0))
+                                                .size(10.0)
+                                                .color(MUTED),
+                                        )
+                                        .on_hover_text("Клавиша нажимается от 40% хода от покоя");
+                                    }
+                                    egui::ComboBox::from_id_salt(("key-trigger", index))
+                                        .selected_text(next.trigger.label())
+                                        .show_ui(ui, |ui| {
+                                            for trigger in TriggerType::ALL {
+                                                ui.selectable_value(
+                                                    &mut next.trigger,
+                                                    trigger,
+                                                    trigger.label(),
+                                                );
+                                            }
+                                        });
+                                    if ui.button("×").on_hover_text("Удалить назначение").clicked()
+                                    {
+                                        remove = Some(index);
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Действие:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut next.action)
+                                            .hint_text("например, Шасси")
+                                            .desired_width(ui.available_width()),
+                                    );
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Клавиша:");
+                                    let key = if self.learning_key == Some(index) {
+                                        "нажмите клавишу…".to_owned()
+                                    } else {
+                                        next.key.label()
+                                    };
+                                    if ui.button(key).on_hover_text("Захват клавиши").clicked()
+                                    {
+                                        learn_key = Some(index);
+                                    }
+                                    egui::ComboBox::from_id_salt(("key-list", index))
+                                        .selected_text("Список")
+                                        .height(320.0)
+                                        .show_ui(ui, |ui| {
+                                            for (vk, name) in KEYS {
+                                                ui.selectable_value(&mut next.key.vk, *vk, *name);
+                                            }
+                                        });
+                                    egui::ComboBox::from_id_salt(("key-mode", index))
+                                        .selected_text(press_mode_label(next.key.mode))
+                                        .show_ui(ui, |ui| {
+                                            for mode in [PressMode::HoldWhilePressed, PressMode::Pulse] {
+                                                ui.selectable_value(
+                                                    &mut next.key.mode,
+                                                    mode,
+                                                    press_mode_label(mode),
+                                                );
+                                            }
+                                        });
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.checkbox(&mut next.key.ctrl, "Ctrl");
+                                    ui.checkbox(&mut next.key.shift, "Shift");
+                                    ui.checkbox(&mut next.key.alt, "Alt");
+                                    ui.checkbox(&mut next.key.win, "Win");
+                                });
+                                let (controls, _) =
+                                    conflicts_for(&profile, next.modifier, next.input, false, None, Some(index));
+                                if next.key.vk != 0 && !controls.is_empty() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Как Xbox этот вход отключён: {}",
+                                            conflict_names(&profile, &controls, &[])
+                                        ))
                                         .size(10.0)
                                         .color(MUTED),
-                                )
-                                .on_hover_text("Клавиша нажимается от 40% хода от покоя");
+                                    );
+                                }
+                            });
+                            ui.add_space(4.0);
+                            if next != *mapping {
+                                updated = Some((index, next));
                             }
-                            egui::ComboBox::from_id_salt(("key-layer", index))
-                                .selected_text(Self::layer_name(next.modifier))
-                                .show_ui(ui, |ui| {
-                                    for layer in &layers {
-                                        ui.selectable_value(
-                                            &mut next.modifier,
-                                            *layer,
-                                            Self::layer_name(*layer),
-                                        );
-                                    }
-                                });
-                            egui::ComboBox::from_id_salt(("key-trigger", index))
-                                .selected_text(next.trigger.label())
-                                .show_ui(ui, |ui| {
-                                    for trigger in TriggerType::ALL {
-                                        ui.selectable_value(
-                                            &mut next.trigger,
-                                            trigger,
-                                            trigger.label(),
-                                        );
-                                    }
-                                });
-                            if ui.button("×").on_hover_text("Удалить назначение").clicked()
-                            {
-                                remove = Some(index);
-                            }
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("Клавиша:");
-                            let key = if self.learning_key == Some(index) {
-                                "нажмите клавишу…".to_owned()
-                            } else {
-                                next.key.label()
-                            };
-                            if ui.button(key).on_hover_text("Захват клавиши").clicked()
-                            {
-                                learn_key = Some(index);
-                            }
-                            egui::ComboBox::from_id_salt(("key-list", index))
-                                .selected_text("Список")
-                                .height(320.0)
-                                .show_ui(ui, |ui| {
-                                    for (vk, name) in KEYS {
-                                        ui.selectable_value(&mut next.key.vk, *vk, *name);
-                                    }
-                                });
-                            ui.checkbox(&mut next.key.ctrl, "Ctrl");
-                            ui.checkbox(&mut next.key.shift, "Shift");
-                            ui.checkbox(&mut next.key.alt, "Alt");
-                            ui.checkbox(&mut next.key.win, "Win");
-                            egui::ComboBox::from_id_salt(("key-mode", index))
-                                .selected_text(press_mode_label(next.key.mode))
-                                .show_ui(ui, |ui| {
-                                    for mode in [PressMode::HoldWhilePressed, PressMode::Pulse] {
-                                        ui.selectable_value(
-                                            &mut next.key.mode,
-                                            mode,
-                                            press_mode_label(mode),
-                                        );
-                                    }
-                                });
-                        });
-                        let (controls, _) =
-                            conflicts_for(&profile, next.modifier, next.input, false, None, Some(index));
-                        if next.key.vk != 0 && !controls.is_empty() {
-                            ui.label(
-                                RichText::new(format!(
-                                    "Как Xbox этот вход отключён: {}",
-                                    conflict_names(&profile, &controls, &[])
-                                ))
-                                .size(10.0)
-                                .color(MUTED),
-                            );
                         }
-                    });
-                ui.add_space(4.0);
-                if next != *mapping {
-                    updated = Some((index, next));
-                }
+                        if ui.button("+ Добавить клавишу").clicked() {
+                            add_to = Some(*layer);
+                        }
+                    }
+                });
+                ui.add_space(6.0);
             }
 
             if let Some((index, mapping)) = updated {
@@ -2080,7 +2158,7 @@ impl X360ceApp {
             if let Some(index) = remove {
                 self.current_profile_mut().keyboard.remove(index);
                 self.cancel_learning();
-                self.status = format!("Клавиатурное назначение {} удалено.", index + 1);
+                self.status = "Клавиатурное назначение удалено.".to_owned();
                 self.profile_changed();
             }
             if let Some(index) = learn_input {
@@ -2089,8 +2167,7 @@ impl X360ceApp {
             if let Some(index) = learn_key {
                 self.begin_learning_key(index);
             }
-            if ui.button("+ Добавить клавишу").clicked() {
-                let layer = self.edit_layer;
+            if let Some(layer) = add_to {
                 let index = {
                     let profile = self.current_profile_mut();
                     profile.keyboard.push(KeyboardMapping {
@@ -2420,6 +2497,18 @@ impl X360ceApp {
         });
     }
 }
+/// Место под зелёный кружок «нажато сейчас»; место резервируется всегда,
+/// чтобы подписи не прыгали.
+fn activity_dot(ui: &mut egui::Ui, on: bool) {
+    let size = egui::vec2(12.0, ui.spacing().interact_size.y);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    if on {
+        ui.painter().circle_filled(rect.center(), 5.5, ACTIVE_DOT);
+        ui.painter()
+            .circle_stroke(rect.center(), 5.5, egui::Stroke::new(1.0, SUCCESS));
+    }
+}
+
 fn surface(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::new()
         .fill(SURFACE)
@@ -2626,12 +2715,6 @@ fn ui_root(app: &mut X360ceApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                             app.render_controller(ui);
                             ui.add_space(8.0);
                             app.render_layers(ui);
-                            ui.add_space(8.0);
-                            app.render_keyboard(ui);
-                            ui.add_space(8.0);
-                            app.render_paddles(ui);
-                            ui.add_space(8.0);
-                            app.render_raw_inputs(ui);
                         });
                         right[0].vertical(|ui| {
                             app.render_profiles(ui);
@@ -2639,7 +2722,20 @@ fn ui_root(app: &mut X360ceApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                             app.render_device_bar(ui);
                             ui.add_space(8.0);
                             app.render_mapping_editor(ui);
+                        });
+                    });
+                    ui.add_space(8.0);
+                    // Во всю ширину: слои клавиатуры стоят колонками рядом.
+                    app.render_keyboard(ui);
+                    ui.add_space(8.0);
+                    ui.columns(2, |columns| {
+                        let (left, right) = columns.split_at_mut(1);
+                        left[0].vertical(|ui| {
+                            app.render_paddles(ui);
                             ui.add_space(8.0);
+                            app.render_raw_inputs(ui);
+                        });
+                        right[0].vertical(|ui| {
                             app.render_settings(ui);
                         });
                     });
