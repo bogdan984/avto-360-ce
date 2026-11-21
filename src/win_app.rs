@@ -364,6 +364,8 @@ impl X360ceApp {
     }
 
     fn profile_changed(&mut self) {
+        let profile = self.current_profile();
+        self.state.sync_library(&profile);
         self.push_profile();
         self.save();
     }
@@ -542,8 +544,7 @@ impl X360ceApp {
         self.learning_control = None;
         self.learning_output_negative = false;
         self.status = format!("{}: {}.{released}", control.label(), binding.label());
-        self.push_profile();
-        self.save();
+        self.profile_changed();
     }
 
     fn begin_learning(&mut self, control: OutputControl) {
@@ -684,8 +685,7 @@ impl X360ceApp {
         self.learning_output_negative = false;
         self.selected_axis_negative = None;
         self.status = format!("Назначение «{}» очищено.", control.label());
-        self.push_profile();
-        self.save();
+        self.profile_changed();
     }
 
     fn set_axis_binding_direction(&mut self, control: OutputControl, positive: bool) {
@@ -714,8 +714,7 @@ impl X360ceApp {
                 control.label(),
                 if positive { "+" } else { "-" }
             );
-            self.push_profile();
-            self.save();
+            self.profile_changed();
         }
     }
 
@@ -861,6 +860,13 @@ impl X360ceApp {
     }
 
     fn export_current_mapping(&mut self) {
+        let typed = self.profile_name_edit.trim().to_owned();
+        if typed.is_empty() || typed != self.current_profile().name {
+            self.status = "Имя в поле не совпадает с именем профиля — сначала нажмите \
+                           «Сохранить» или «Переименовать», затем «Экспорт…»."
+                .to_owned();
+            return;
+        }
         match profile_io::export_profile(&self.current_profile()) {
             Ok(Some(path)) => {
                 self.status = format!("Профиль экспортирован: {}", path.display());
@@ -877,11 +883,17 @@ impl X360ceApp {
     fn import_mapping(&mut self) {
         match profile_io::import_profile() {
             Ok(Some((path, mut profile))) => {
-                let base = profile.name.clone();
-                let mut number = 2;
-                while self.state.library.iter().any(|saved| saved.name == profile.name) {
-                    profile.name = format!("{base} ({number})");
-                    number += 1;
+                if self.state.library.iter().any(|saved| saved.name == profile.name) {
+                    match profile_io::ask_name_conflict(&profile.name) {
+                        profile_io::NameConflict::Replace => {}
+                        profile_io::NameConflict::KeepBoth => {
+                            profile.name = self.state.free_library_name(&profile.name);
+                        }
+                        profile_io::NameConflict::Cancel => {
+                            self.status = "Импорт отменён.".to_owned();
+                            return;
+                        }
+                    }
                 }
                 self.upsert_library(profile.clone());
                 let name = profile.name.clone();
@@ -1682,8 +1694,7 @@ impl X360ceApp {
                         .changed();
                 }
                 if changed {
-                    self.push_profile();
-                    self.save();
+                    self.profile_changed();
                 }
                 if calibrate {
                     self.calibrate_rest();

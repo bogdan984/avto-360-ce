@@ -1,12 +1,19 @@
 use crate::model::ControllerProfile;
 use crate::wide::str_wide_null;
 use anyhow::{Context, Result};
-use std::{ffi::OsString, fs, os::windows::ffi::OsStringExt, path::PathBuf};
+use std::{
+    ffi::OsString,
+    fs,
+    os::windows::ffi::OsStringExt,
+    path::{Path, PathBuf},
+};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
     OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, IDNO, IDYES, MB_ICONQUESTION, MB_YESNOCANCEL, MessageBoxW,
+};
 
 /// Фильтр для стандартного окна Windows: пары «название\0маска\0», в конце \0.
 const FILTER: &str = "Профиль x360ce (*.json)\0*.json\0Все файлы (*.*)\0*.*\0";
@@ -32,7 +39,13 @@ pub fn import_profile() -> Result<Option<(PathBuf, ControllerProfile)>> {
 
     let bytes = fs::read(&path)
         .with_context(|| format!("не удалось прочитать файл профиля: {}", path.display()))?;
-    let mut profile: ControllerProfile = serde_json::from_slice(&bytes)
+    let profile = parse_profile(&bytes, &path)?;
+    Ok(Some((path, profile)))
+}
+
+/// Имя берётся из файла как есть; если его нет — из имени файла.
+fn parse_profile(bytes: &[u8], path: &Path) -> Result<ControllerProfile> {
+    let mut profile: ControllerProfile = serde_json::from_slice(bytes)
         .with_context(|| format!("неверный файл профиля x360ce: {}", path.display()))?;
     if profile.name.trim().is_empty() {
         profile.name = path
@@ -43,7 +56,37 @@ pub fn import_profile() -> Result<Option<(PathBuf, ControllerProfile)>> {
             .unwrap_or_else(|| "Импортированный профиль".to_owned());
     }
     profile.sanitize();
-    Ok(Some((path, profile)))
+    Ok(profile)
+}
+
+pub enum NameConflict {
+    Replace,
+    KeepBoth,
+    Cancel,
+}
+
+/// Профиль с таким именем уже есть в списке: спросить, что делать.
+pub fn ask_name_conflict(name: &str) -> NameConflict {
+    let text = str_wide_null(&format!(
+        "Профиль «{name}» уже есть в списке.\n\n\
+         Да — заменить его импортируемым.\n\
+         Нет — сохранить импортируемый как копию с другим именем.\n\
+         Отмена — ничего не импортировать."
+    ));
+    let caption = str_wide_null("Импорт профиля");
+    let answer = unsafe {
+        MessageBoxW(
+            GetForegroundWindow(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_YESNOCANCEL | MB_ICONQUESTION,
+        )
+    };
+    match answer {
+        IDYES => NameConflict::Replace,
+        IDNO => NameConflict::KeepBoth,
+        _ => NameConflict::Cancel,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -120,5 +163,37 @@ fn sanitize_filename(value: &str) -> String {
         "profile".to_owned()
     } else {
         sanitized.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_json(name: &str) -> Vec<u8> {
+        let mut profile = ControllerProfile::default_for("guid".to_owned());
+        profile.name = name.to_owned();
+        serde_json::to_vec_pretty(&profile).unwrap()
+    }
+
+    #[test]
+    fn import_keeps_name_from_file_contents() {
+        let path = Path::new(r"C:\tmp\переименованный файл.x360ce.json");
+        let profile = parse_profile(&profile_json("  DCS F-16 "), path).unwrap();
+        assert_eq!(profile.name, "DCS F-16");
+    }
+
+    #[test]
+    fn import_without_name_uses_file_name() {
+        let path = Path::new(r"C:\tmp\SnowRunner.x360ce.json");
+        let profile = parse_profile(br#"{"entries": []}"#, path).unwrap();
+        assert_eq!(profile.name, "SnowRunner");
+        assert!(parse_profile(b"not json", path).is_err());
+    }
+
+    #[test]
+    fn export_file_name_matches_profile_name() {
+        assert_eq!(sanitize_filename("DCS: F/A-18"), "DCS- F-A-18");
+        assert_eq!(sanitize_filename("Руль ARTPLAYS"), "Руль ARTPLAYS");
     }
 }

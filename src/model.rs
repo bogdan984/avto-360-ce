@@ -485,7 +485,9 @@ pub const MAX_MODIFIERS: usize = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControllerProfile {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub device_guid: String,
     #[serde(default)]
     pub entries: Vec<MappingEntry>,

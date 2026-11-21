@@ -85,6 +85,31 @@ impl Default for SavedState {
     }
 }
 
+impl SavedState {
+    /// Записывает текущие назначения в одноимённый профиль списка, чтобы
+    /// при переключении профилей каждый показывал свои кнопки.
+    pub fn sync_library(&mut self, profile: &ControllerProfile) {
+        if let Some(slot) = self.library.iter_mut().find(|saved| saved.name == profile.name) {
+            *slot = ControllerProfile {
+                device_guid: String::new(),
+                ..profile.clone()
+            };
+        }
+    }
+
+    /// Свободное имя в списке: `base`, иначе `base (2)`, `base (3)`, …
+    pub fn free_library_name(&self, base: &str) -> String {
+        let taken = |name: &str| self.library.iter().any(|saved| saved.name == name);
+        if !taken(base) {
+            return base.to_owned();
+        }
+        (2..)
+            .map(|number| format!("{base} ({number})"))
+            .find(|name| !taken(name))
+            .unwrap_or_default()
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -244,4 +269,48 @@ pub fn seconds_since_unix_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{InputBinding, OutputControl};
+
+    fn named(name: &str) -> ControllerProfile {
+        ControllerProfile {
+            name: name.to_owned(),
+            ..ControllerProfile::default_for(String::new())
+        }
+    }
+
+    #[test]
+    fn sync_library_updates_only_profile_with_same_name() {
+        let mut state = SavedState {
+            library: vec![named("DCS"), named("SnowRunner")],
+            ..SavedState::default()
+        };
+        let mut active = named("DCS");
+        active.device_guid = "guid".to_owned();
+        active.entry_mut(OutputControl::A).binding = InputBinding::Button { index: 42 };
+        state.sync_library(&active);
+
+        let json = |profile: &ControllerProfile| serde_json::to_string(&profile.entries).unwrap();
+        let dcs = &state.library[0];
+        assert_eq!(json(dcs), json(&active));
+        assert!(dcs.device_guid.is_empty());
+        assert_ne!(json(&state.library[1]), json(&active));
+
+        state.sync_library(&named("Нет в списке"));
+        assert_eq!(state.library.len(), 2);
+    }
+
+    #[test]
+    fn free_library_name_keeps_given_name_when_free() {
+        let state = SavedState {
+            library: vec![named("DCS"), named("DCS (2)")],
+            ..SavedState::default()
+        };
+        assert_eq!(state.free_library_name("Руль"), "Руль");
+        assert_eq!(state.free_library_name("DCS"), "DCS (3)");
+    }
 }
