@@ -20,6 +20,7 @@ mod mapper;
 mod paddle;
 #[cfg(windows)]
 mod profile_io;
+mod profile_store;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]

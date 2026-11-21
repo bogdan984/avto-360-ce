@@ -26,7 +26,7 @@ use crate::{
         KeyboardMapping, MappingEntry, ModifierConfig, ModifierMode, OutputControl, PaddleAxis,
         PressMode, RawState, RuntimeSnapshot, TriggerType, KEYS, MAX_MODIFIERS,
     },
-    profile_io,
+    profile_io, profile_store,
     single_instance::BuildKind,
     startup, updater,
     wide::str_wide_null,
@@ -235,6 +235,7 @@ struct X360ceApp {
     joycpl_rx: Option<Receiver<Result<u32, String>>>,
     /// Поле «Имя» в блоке профилей.
     profile_name_edit: String,
+    last_profiles_scan: Instant,
     /// Автоопределение покоя осей: последние значения и с какого момента не менялись.
     rest_probe: Option<(Vec<i16>, Instant)>,
     /// После подключения оси уже менялись (контроллер прислал данные).
@@ -330,6 +331,7 @@ impl X360ceApp {
             joycpl_pid: None,
             joycpl_rx: Some(joycpl_rx),
             profile_name_edit,
+            last_profiles_scan: Instant::now(),
             rest_probe: None,
             rest_activity: false,
         }
@@ -795,12 +797,17 @@ impl X360ceApp {
         self.push_profile();
     }
 
+    /// Имя из поля «Имя», пригодное для файла в папке профилей.
+    fn typed_profile_name(&self) -> String {
+        profile_store::clean_name(&self.profile_name_edit)
+    }
+
     /// Новый пустой профиль с именем из поля (или «Новый профиль N»), сразу активный.
     fn create_new_profile(&mut self) {
-        let typed = self.profile_name_edit.trim().to_owned();
+        let typed = self.typed_profile_name();
         let name = if typed.is_empty() || typed == self.current_profile().name {
             self.state.free_library_name("Новый профиль")
-        } else if self.state.library.iter().any(|saved| saved.name == typed) {
+        } else if self.state.has_profile(&typed) {
             self.status = format!("Профиль «{typed}» уже есть — введите другое имя.");
             return;
         } else {
@@ -813,12 +820,12 @@ impl X360ceApp {
     }
 
     fn save_profile_to_library(&mut self) {
-        let name = self.profile_name_edit.trim().to_owned();
+        let name = self.typed_profile_name();
         if name.is_empty() {
             self.status = "Введите имя профиля.".to_owned();
             return;
         }
-        let existed = self.state.library.iter().any(|saved| saved.name == name);
+        let existed = self.state.has_profile(&name);
         self.current_profile_mut().name = name.clone();
         let profile = self.current_profile();
         self.upsert_library(profile);
@@ -833,19 +840,11 @@ impl X360ceApp {
 
     fn rename_profile(&mut self) {
         let old = self.current_profile().name;
-        let new = self.profile_name_edit.trim().to_owned();
-        if new.is_empty() || new == old || self.state.library.iter().any(|saved| saved.name == new) {
+        let new = self.typed_profile_name();
+        if new.is_empty() || new == old || self.state.has_profile(&new) {
             return;
         }
-        for saved in self.state.library.iter_mut().filter(|saved| saved.name == old) {
-            saved.name = new.clone();
-        }
-        self.state
-            .library
-            .sort_by_key(|saved| saved.name.to_lowercase());
-        for profile in self.state.profiles.values_mut().filter(|profile| profile.name == old) {
-            profile.name = new.clone();
-        }
+        self.state.rename_profile(&old, &new);
         self.profile_name_edit = new.clone();
         self.status = format!("Профиль «{old}» переименован в «{new}».");
         self.profile_changed();
@@ -862,9 +861,47 @@ impl X360ceApp {
     }
 
     fn delete_library_profile(&mut self, name: &str) {
-        self.state.library.retain(|saved| saved.name != name);
-        self.status = format!("Профиль «{name}» удалён из списка (текущие назначения не изменены).");
+        match self.state.delete_profile(name) {
+            Some(next) => {
+                self.active_profile_replaced();
+                self.status = format!("Профиль «{name}» удалён, включён «{next}».");
+            }
+            None => self.status = format!("Профиль «{name}» удалён."),
+        }
         self.save();
+    }
+
+    /// Активный профиль сменился не из окна (удаление, папка): обновить поле и движок.
+    fn active_profile_replaced(&mut self) {
+        self.profile_name_edit = self.current_profile().name;
+        self.edit_layer = None;
+        self.cancel_learning();
+        self.selected_axis_negative = None;
+        self.push_profile();
+    }
+
+    /// Папку профилей могли изменить в проводнике — перечитываем раз в 2 с.
+    fn poll_profiles_dir(&mut self) {
+        if self.last_profiles_scan.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_profiles_scan = Instant::now();
+        if let Some(message) = self.state.rescan_profiles() {
+            self.active_profile_replaced();
+            self.status = message;
+            self.save();
+        }
+    }
+
+    fn open_profiles_folder(&mut self) {
+        let Some(dir) = self.state.profiles_dir.clone() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        match std::process::Command::new("explorer.exe").arg(&dir).spawn() {
+            Ok(_) => self.status = format!("Открыта папка профилей: {}", dir.display()),
+            Err(error) => self.status = format!("Не удалось открыть папку профилей: {error}"),
+        }
     }
 
     fn export_current_mapping(&mut self) {
@@ -891,7 +928,8 @@ impl X360ceApp {
     fn import_mapping(&mut self) {
         match profile_io::import_profile() {
             Ok(Some((path, mut profile))) => {
-                if self.state.library.iter().any(|saved| saved.name == profile.name) {
+                profile.name = config::profile_name_or_default(&profile.name);
+                if self.state.has_profile(&profile.name) {
                     match profile_io::ask_name_conflict(&profile.name) {
                         profile_io::NameConflict::Replace => {}
                         profile_io::NameConflict::KeepBoth => {
@@ -1117,6 +1155,7 @@ impl eframe::App for X360ceApp {
         }
 
         self.poll_runtime();
+        self.poll_profiles_dir();
         self.poll_tray(ctx);
         self.poll_learning();
         self.poll_key_capture(ctx);
@@ -1312,10 +1351,10 @@ impl X360ceApp {
                 {
                     self.save_profile_to_library();
                 }
-                let new_name = self.profile_name_edit.trim().to_owned();
+                let new_name = self.typed_profile_name();
                 let can_rename = !new_name.is_empty()
                     && new_name != active.name
-                    && !self.state.library.iter().any(|saved| saved.name == new_name);
+                    && !self.state.has_profile(&new_name);
                 if ui
                     .add_enabled(can_rename, egui::Button::new("Переименовать"))
                     .on_hover_text("Дать текущему профилю новое имя (без создания копии)")
@@ -1354,6 +1393,16 @@ impl X360ceApp {
                     .clicked()
                 {
                     delete = Some(name);
+                }
+                if ui
+                    .button("Открыть папку профилей")
+                    .on_hover_text(
+                        "Папка, где лежит каждый профиль (файл = имя профиля). \
+                         Файлы можно переименовывать и удалять — список обновится сам.",
+                    )
+                    .clicked()
+                {
+                    self.open_profiles_folder();
                 }
             });
             if let Some(name) = load {

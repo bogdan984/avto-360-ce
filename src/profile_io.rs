@@ -19,7 +19,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const FILTER: &str = "Профиль x360ce (*.json)\0*.json\0Все файлы (*.*)\0*.*\0";
 
 pub fn export_profile(profile: &ControllerProfile) -> Result<Option<PathBuf>> {
-    let default_name = format!("{}.x360ce.json", sanitize_filename(&profile.name));
+    let default_name = format!("{}.x360ce.json", crate::config::profile_name_or_default(&profile.name));
     let Some(path) = choose_path(DialogKind::Save, &default_name)? else {
         return Ok(None);
     };
@@ -144,28 +144,6 @@ fn choose_path(kind: DialogKind, default_name: &str) -> Result<Option<PathBuf>> 
     Ok(Some(PathBuf::from(OsString::from_wide(&file[..len]))))
 }
 
-/// Имя файла из названия профиля: кириллица остаётся, запрещённые в
-/// Windows символы заменяются на «-».
-fn sanitize_filename(value: &str) -> String {
-    let sanitized: String = value
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_control() || r#"<>:"/\|?*"#.contains(character) {
-                '-'
-            } else {
-                character
-            }
-        })
-        .collect();
-    let sanitized = sanitized.trim_matches(|c: char| c == '.' || c == ' ' || c == '-');
-    if sanitized.is_empty() {
-        "profile".to_owned()
-    } else {
-        sanitized.to_owned()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,11 +167,5 @@ mod tests {
         let profile = parse_profile(br#"{"entries": []}"#, path).unwrap();
         assert_eq!(profile.name, "SnowRunner");
         assert!(parse_profile(b"not json", path).is_err());
-    }
-
-    #[test]
-    fn export_file_name_matches_profile_name() {
-        assert_eq!(sanitize_filename("DCS: F/A-18"), "DCS- F-A-18");
-        assert_eq!(sanitize_filename("Руль ARTPLAYS"), "Руль ARTPLAYS");
     }
 }
