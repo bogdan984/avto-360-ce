@@ -23,7 +23,7 @@ use crate::{
     game_bar, joycpl, mapper,
     model::{
         entry_mut_in, inputs_overlap, key_name, same_device, ControllerProfile, InputBinding, KeyOutput,
-        KeyboardMapping, MappingEntry, ModifierConfig, ModifierMode, OutputControl, PaddleAxis,
+        KeyboardMapping, MappingEntry, ModifierConfig, ModifierMode, MouseDirection, OutputControl, PaddleAxis,
         PressMode, RawState, RuntimeSnapshot, TriggerType, KEYS, MAX_MODIFIERS,
     },
     profile_io, profile_store,
@@ -231,6 +231,8 @@ struct X360ceApp {
     learning_modifier: Option<usize>,
     learning_keyboard_input: Option<usize>,
     learning_key: Option<usize>,
+    /// Захват кнопки для движения мыши: (слой, направление).
+    learning_mouse: Option<(Option<usize>, MouseDirection)>,
     joycpl_pid: Option<u32>,
     joycpl_rx: Option<Receiver<Result<u32, String>>>,
     /// Поле «Имя» в блоке профилей.
@@ -328,6 +330,7 @@ impl X360ceApp {
             learning_modifier: None,
             learning_keyboard_input: None,
             learning_key: None,
+            learning_mouse: None,
             joycpl_pid: None,
             joycpl_rx: Some(joycpl_rx),
             profile_name_edit,
@@ -378,6 +381,7 @@ impl X360ceApp {
         self.learning_modifier = None;
         self.learning_keyboard_input = None;
         self.learning_key = None;
+        self.learning_mouse = None;
     }
 
     fn current_profile(&self) -> ControllerProfile {
@@ -472,6 +476,7 @@ impl X360ceApp {
         if self.learning_modifier.is_none()
             && self.learning_keyboard_input.is_none()
             && self.learning_control.is_none()
+            && self.learning_mouse.is_none()
         {
             return;
         }
@@ -506,6 +511,17 @@ impl X360ceApp {
                 index + 1,
                 binding.label()
             );
+            self.profile_changed();
+            return;
+        }
+        if let Some((layer, direction)) = self.learning_mouse.take() {
+            // Сначала снимаем конфликты (в том числе прежнюю мышь на этом входе),
+            // потом назначаем — иначе снялось бы и само новое назначение.
+            let released = self.release_conflicts(layer, binding, false, None, None);
+            self.current_profile_mut()
+                .mouse_mapping_mut(layer, direction)
+                .input = binding;
+            self.status = format!("{}: {}.{released}", direction.label(), binding.label());
             self.profile_changed();
             return;
         }
@@ -732,11 +748,26 @@ impl X360ceApp {
     ) -> String {
         let profile = self.current_profile();
         let (controls, keys) = conflicts_for(&profile, layer, binding, full, skip_control, skip_key);
-        if controls.is_empty() && keys.is_empty() {
+        let mice: Vec<MouseDirection> = profile
+            .mouse
+            .iter()
+            .filter(|mapping| {
+                mapping.modifier == layer && inputs_overlap(binding, full, mapping.input, false)
+            })
+            .map(|mapping| mapping.direction)
+            .collect();
+        if controls.is_empty() && keys.is_empty() && mice.is_empty() {
             return String::new();
         }
-        let names = conflict_names(&profile, &controls, &keys);
+        let names = std::iter::once(conflict_names(&profile, &controls, &keys))
+            .chain(mice.iter().map(|direction| direction.label().to_lowercase()))
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ");
         let profile = self.current_profile_mut();
+        for direction in mice {
+            profile.mouse_mapping_mut(layer, direction).input = InputBinding::None;
+        }
         let entries = match layer.filter(|layer| *layer < profile.modifiers.len()) {
             Some(layer) => &mut profile.modifiers[layer].entries,
             None => &mut profile.entries,
@@ -1069,7 +1100,8 @@ impl X360ceApp {
         let axes = self.runtime.raw_state.axes.clone();
         let learning = self.learning_control.is_some()
             || self.learning_keyboard_input.is_some()
-            || self.learning_modifier.is_some();
+            || self.learning_modifier.is_some()
+            || self.learning_mouse.is_some();
         let profile = self.current_profile();
         let missing = (0..axes.len())
             .any(|index| profile.axis_rest.get(index).copied().flatten().is_none());
@@ -1148,7 +1180,8 @@ impl eframe::App for X360ceApp {
         let learning = self.learning_control.is_some()
             || self.learning_modifier.is_some()
             || self.learning_keyboard_input.is_some()
-            || self.learning_key.is_some();
+            || self.learning_key.is_some()
+            || self.learning_mouse.is_some();
         if learning && ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.cancel_learning();
             self.status = "Захват назначения отменён.".to_owned();
@@ -2280,6 +2313,125 @@ impl X360ceApp {
         });
     }
 
+    fn render_mouse(&mut self, ui: &mut egui::Ui) {
+        surface(ui, |ui| {
+            ui.label(RichText::new("Мышь (обзор камеры)").strong());
+            ui.label(
+                RichText::new(
+                    "Пока кнопка зажата, мышь движется в выбранную сторону — например, обзор \
+                     камеры в игре. Скорость 1–100 %: чем больше, тем быстрее. В каждом слое \
+                     модификатора свои кнопки. Вход, назначенный на мышь, перестаёт работать \
+                     как Xbox и клавиша в этом слое.",
+                )
+                .size(11.0)
+                .color(MUTED),
+            );
+            ui.add_space(6.0);
+
+            let profile = self.current_profile();
+            let layers: Vec<Option<usize>> = std::iter::once(None)
+                .chain((0..profile.modifiers.len()).map(Some))
+                .collect();
+            let mut learn = None;
+            let mut clear = None;
+            let mut speed_changed = None;
+            let per_row = layers.len().min(3);
+            for row in layers.chunks(per_row) {
+                ui.columns(per_row, |columns| {
+                    for (column, layer) in row.iter().enumerate() {
+                        let ui = &mut columns[column];
+                        ui.label(
+                            RichText::new(Self::layer_name(&profile, *layer))
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        for direction in MouseDirection::ALL {
+                            let mapping = profile.mouse_mapping(*layer, direction);
+                            let input = mapping.map(|m| m.input).unwrap_or(InputBinding::None);
+                            let mut speed = mapping
+                                .map(|m| m.speed)
+                                .unwrap_or_else(crate::model::default_mouse_speed);
+                            egui::Frame::new()
+                                .fill(SURFACE_MUTED)
+                                .corner_radius(8)
+                                .inner_margin(egui::Margin::same(6))
+                                .show(ui, |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.add_sized(
+                                            [84.0, 18.0],
+                                            egui::Label::new(RichText::new(direction.label()).strong()),
+                                        );
+                                        let text = if self.learning_mouse == Some((*layer, direction)) {
+                                            "нажмите кнопку…".to_owned()
+                                        } else {
+                                            input.label()
+                                        };
+                                        let active = input != InputBinding::None
+                                            && mapper::input_pressed(input, &self.runtime.raw_state);
+                                        activity_dot(ui, active);
+                                        let text = if active {
+                                            RichText::new(text).strong().color(SUCCESS)
+                                        } else {
+                                            RichText::new(text)
+                                        };
+                                        if ui
+                                            .button(text)
+                                            .on_hover_text("Назначить кнопку контроллера")
+                                            .clicked()
+                                        {
+                                            learn = Some((*layer, direction));
+                                        }
+                                        if input != InputBinding::None
+                                            && ui.button("×").on_hover_text("Снять кнопку").clicked()
+                                        {
+                                            clear = Some((*layer, direction));
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("Скорость").size(12.0));
+                                        let slider = ui.add(
+                                            egui::Slider::new(&mut speed, 1..=100).show_value(false),
+                                        );
+                                        let field = ui.add(
+                                            egui::DragValue::new(&mut speed)
+                                                .range(1..=100)
+                                                .speed(0.5)
+                                                .suffix(" %"),
+                                        );
+                                        if (slider | field).changed() {
+                                            speed_changed = Some((*layer, direction, speed));
+                                        }
+                                    });
+                                });
+                            ui.add_space(3.0);
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+            }
+
+            if let Some((layer, direction, speed)) = speed_changed {
+                self.current_profile_mut().mouse_mapping_mut(layer, direction).speed = speed;
+                self.profile_changed();
+            }
+            if let Some((layer, direction)) = clear {
+                self.current_profile_mut().mouse_mapping_mut(layer, direction).input = InputBinding::None;
+                self.cancel_learning();
+                self.status = format!("{}: кнопка снята.", direction.label());
+                self.profile_changed();
+            }
+            if let Some((layer, direction)) = learn {
+                self.cancel_learning();
+                self.learning_mouse = Some((layer, direction));
+                self.learn_baseline = self.runtime.raw_state.clone();
+                self.status = format!(
+                    "{}: нажмите кнопку на контроллере (Esc — отмена).",
+                    direction.label()
+                );
+            }
+        });
+    }
+
     fn render_paddles(&mut self, ui: &mut egui::Ui) {
         surface(ui, |ui| {
             ui.label(RichText::new("Педали и лепестки на одной оси").strong());
@@ -2824,6 +2976,8 @@ fn ui_root(app: &mut X360ceApp, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
                     ui.add_space(8.0);
                     // Во всю ширину: слои клавиатуры стоят колонками рядом.
                     app.render_keyboard(ui);
+                    ui.add_space(8.0);
+                    app.render_mouse(ui);
                     ui.add_space(8.0);
                     ui.columns(2, |columns| {
                         let (left, right) = columns.split_at_mut(1);

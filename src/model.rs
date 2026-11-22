@@ -358,6 +358,50 @@ pub struct KeyboardMapping {
     pub action: String,
 }
 
+/// Направление движения мыши (обзор камеры кнопками).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MouseDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl MouseDirection {
+    pub const ALL: [Self; 4] = [Self::Left, Self::Right, Self::Up, Self::Down];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Мышь влево",
+            Self::Right => "Мышь вправо",
+            Self::Up => "Мышь вверх",
+            Self::Down => "Мышь вниз",
+        }
+    }
+}
+
+/// Скорость мыши 100 % — пикселей в секунду; 1 % — сотая часть.
+pub const MOUSE_MAX_PX_PER_SEC: f32 = 2000.0;
+
+/// Пока кнопка зажата, мышь движется в `direction` со скоростью `speed` %.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MouseMapping {
+    #[serde(default)]
+    pub input: InputBinding,
+    /// None — основной слой, Some(n) — слой модификатора n.
+    #[serde(default)]
+    pub modifier: Option<usize>,
+    pub direction: MouseDirection,
+    /// 1..=100 %.
+    #[serde(default = "default_mouse_speed")]
+    pub speed: u8,
+}
+
+pub fn default_mouse_speed() -> u8 {
+    30
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timings {
     #[serde(default = "default_double_tap_window_ms")]
@@ -510,6 +554,9 @@ pub struct ControllerProfile {
     pub modifiers: Vec<ModifierConfig>,
     #[serde(default)]
     pub keyboard: Vec<KeyboardMapping>,
+    /// Кнопки, двигающие мышь (обзор камеры).
+    #[serde(default)]
+    pub mouse: Vec<MouseMapping>,
     #[serde(default)]
     pub timings: Timings,
     #[serde(default)]
@@ -603,6 +650,7 @@ impl ControllerProfile {
             entries,
             modifiers: Vec::new(),
             keyboard: Vec::new(),
+            mouse: Vec::new(),
             timings: Timings::default(),
             paddle_axes: Vec::new(),
             axis_rest: Vec::new(),
@@ -669,6 +717,11 @@ impl ControllerProfile {
         let layers = self.modifiers.len();
         self.keyboard
             .retain(|mapping| mapping.modifier.is_none_or(|layer| layer < layers));
+        self.mouse
+            .retain(|mapping| mapping.modifier.is_none_or(|layer| layer < layers));
+        for mapping in &mut self.mouse {
+            mapping.speed = mapping.speed.clamp(1, 100);
+        }
         let mut seen = Vec::new();
         self.entries.retain(|entry| {
             let fresh = !seen.contains(&entry.control);
@@ -707,6 +760,39 @@ impl ControllerProfile {
                 }
             }
         }
+        self.mouse.retain(|mapping| mapping.modifier != Some(index));
+        for mapping in &mut self.mouse {
+            if let Some(layer) = mapping.modifier.as_mut() {
+                if *layer > index {
+                    *layer -= 1;
+                }
+            }
+        }
+    }
+
+    /// Назначение мыши слоя `layer` в направлении `direction`.
+    pub fn mouse_mapping(&self, layer: Option<usize>, direction: MouseDirection) -> Option<&MouseMapping> {
+        self.mouse
+            .iter()
+            .find(|mapping| mapping.modifier == layer && mapping.direction == direction)
+    }
+
+    /// То же, с созданием пустого назначения, если его нет.
+    pub fn mouse_mapping_mut(&mut self, layer: Option<usize>, direction: MouseDirection) -> &mut MouseMapping {
+        if let Some(index) = self
+            .mouse
+            .iter()
+            .position(|mapping| mapping.modifier == layer && mapping.direction == direction)
+        {
+            return &mut self.mouse[index];
+        }
+        self.mouse.push(MouseMapping {
+            input: InputBinding::None,
+            modifier: layer,
+            direction,
+            speed: default_mouse_speed(),
+        });
+        self.mouse.last_mut().expect("mouse mapping was inserted")
     }
 }
 
@@ -791,6 +877,27 @@ mod sanitize_tests {
         let mut separate = ControllerProfile::default_for(String::new());
         separate.sanitize();
         assert!(!separate.entry(OutputControl::LeftTrigger).unwrap().centered_axis);
+    }
+
+    #[test]
+    fn mouse_mappings_load_save_and_follow_modifier_removal() {
+        let old: ControllerProfile = serde_json::from_str(r#"{"name":"old"}"#).unwrap();
+        assert!(old.mouse.is_empty(), "старый профиль без мыши");
+
+        let mut profile = ControllerProfile::default_for(String::new());
+        profile.modifiers = vec![ModifierConfig::default(), ModifierConfig::default()];
+        profile.mouse_mapping_mut(Some(1), MouseDirection::Up).input = InputBinding::Button { index: 3 };
+        profile.mouse_mapping_mut(Some(0), MouseDirection::Left).speed = 0;
+        let json = serde_json::to_string(&profile).unwrap();
+        let mut loaded: ControllerProfile = serde_json::from_str(&json).unwrap();
+        loaded.sanitize();
+        assert_eq!(loaded.mouse_mapping(Some(0), MouseDirection::Left).unwrap().speed, 1, "скорость не ниже 1 %");
+        assert_eq!(loaded.mouse_mapping(None, MouseDirection::Up), None);
+
+        loaded.remove_modifier(0);
+        assert_eq!(loaded.mouse.len(), 1);
+        let up = loaded.mouse_mapping(Some(0), MouseDirection::Up).unwrap();
+        assert_eq!((up.input, up.speed), (InputBinding::Button { index: 3 }, default_mouse_speed()));
     }
 }
 

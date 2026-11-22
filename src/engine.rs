@@ -2,6 +2,7 @@ use crate::{
     driver,
     keyboard_output::KeyboardOutput,
     mapper::MapperState,
+    mouse_output::MouseOutput,
     model::{ControllerProfile, DeviceDescriptor, HatDirection, RawState, RuntimeSnapshot},
     paddle::PaddleFilter,
     virtual_gamepad::VirtualGamepad,
@@ -135,6 +136,7 @@ fn run_worker(
     let mut paddle_filter = PaddleFilter::default();
     // Объявлена после SDL: при выходе из функции отпускает все клавиши.
     let mut keyboard = KeyboardOutput::default();
+    let mut mouse = MouseOutput::default();
     let mut previous_raw = RawState::default();
     let mut sequence = 0_u64;
     let mut last_enumeration = Instant::now();
@@ -227,6 +229,10 @@ fn run_worker(
                 .as_ref()
                 .map(|output| output.keys.as_slice())
                 .unwrap_or(&[]),
+        );
+        mouse.update(
+            output.as_ref().map(|output| output.mouse).unwrap_or_default(),
+            Instant::now(),
         );
 
         if let (Some(output), true) = (&output, driver_installed && virtual_pad) {

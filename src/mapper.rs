@@ -1,6 +1,7 @@
 use crate::model::{
     inputs_overlap, ControllerProfile, HatDirection, InputBinding, KeyOutput, MappingEntry,
-    ModifierMode, OutputControl, PressMode, RawState, TriggerType,
+    ModifierMode, MouseDirection, OutputControl, PressMode, RawState, TriggerType,
+    MOUSE_MAX_PX_PER_SEC,
 };
 use std::time::{Duration, Instant};
 use vigem_rust::{X360Button, X360Report};
@@ -140,12 +141,14 @@ pub const PULSE: Duration = Duration::from_millis(40);
 enum Action {
     Xbox(OutputControl),
     Key(KeyOutput),
+    /// Движение мыши, скорость в % (1..=100).
+    Mouse(MouseDirection, u8),
 }
 
 impl Action {
     fn hold_allowed(self) -> bool {
         match self {
-            Self::Xbox(_) => true,
+            Self::Xbox(_) | Self::Mouse(..) => true,
             Self::Key(key) => key.mode == PressMode::HoldWhilePressed,
         }
     }
@@ -212,17 +215,29 @@ fn rules_for(
             rules.push(mapping.trigger, Action::Key(mapping.key));
         }
     }
+    for mapping in &profile.mouse {
+        if mapping.input == binding && mapping.modifier == layer {
+            rules.push(
+                TriggerType::Direct,
+                Action::Mouse(mapping.direction, mapping.speed),
+            );
+        }
+    }
     rules
 }
 
-/// Вход назначен на клавишу в этом слое — тогда назначение Xbox на тот же
-/// вход не работает: один вход либо джойстик, либо клавиатура, не оба сразу.
+/// Вход назначен на клавишу или мышь в этом слое — тогда назначение Xbox на
+/// тот же вход не работает: один вход либо джойстик, либо клавиатура/мышь.
 pub fn keyboard_owns(profile: &ControllerProfile, layer: Option<usize>, entry: &MappingEntry) -> bool {
-    profile.keyboard.iter().any(|mapping| {
-        mapping.modifier == layer
-            && mapping.key.vk != 0
-            && inputs_overlap(mapping.input, false, entry.binding, entry.uses_full_axis())
-    })
+    let overlaps = |input| inputs_overlap(input, false, entry.binding, entry.uses_full_axis());
+    profile
+        .keyboard
+        .iter()
+        .any(|mapping| mapping.modifier == layer && mapping.key.vk != 0 && overlaps(mapping.input))
+        || profile
+            .mouse
+            .iter()
+            .any(|mapping| mapping.modifier == layer && overlaps(mapping.input))
 }
 
 /// Состояние одного отслеживаемого физического входа.
@@ -264,6 +279,8 @@ pub struct MapperOutput {
     pub report: X360Report,
     /// Клавиши, которые должны быть зажаты прямо сейчас.
     pub keys: Vec<KeyOutput>,
+    /// Скорость мыши, пикселей в секунду (x — вправо, y — вниз).
+    pub mouse: (f32, f32),
 }
 
 /// Конечный автомат нажатий: модификаторы, одиночное/двойное/долгое
@@ -427,7 +444,10 @@ impl MapperState {
         let mut output = MapperOutput {
             report: map_direct_report(profile, raw, &suppressed),
             keys: Vec::new(),
+            mouse: (0.0, 0.0),
         };
+        // Самая быстрая из зажатых кнопок каждого направления.
+        let mut mouse = [0_u8; 4];
         let held = self
             .tracks
             .iter()
@@ -444,8 +464,15 @@ impl MapperState {
                         output.keys.push(key);
                     }
                 }
+                Action::Mouse(direction, speed) => {
+                    let slot = &mut mouse[direction as usize];
+                    *slot = (*slot).max(speed.min(100));
+                }
             }
         }
+        let px = |speed: u8| f32::from(speed) / 100.0 * MOUSE_MAX_PX_PER_SEC;
+        let [left, right, up, down] = mouse;
+        output.mouse = (px(right) - px(left), px(down) - px(up));
         output
     }
 
@@ -464,6 +491,9 @@ impl MapperState {
             }
         }
         for mapping in &profile.keyboard {
+            add(mapping.input);
+        }
+        for mapping in &profile.mouse {
             add(mapping.input);
         }
         for entry in &profile.entries {
@@ -1106,6 +1136,56 @@ mod tests {
 
     fn ms(start: Instant, millis: u64) -> Instant {
         start + Duration::from_millis(millis)
+    }
+
+    fn mouse(input: InputBinding, modifier: Option<usize>, direction: MouseDirection, speed: u8) -> crate::model::MouseMapping {
+        crate::model::MouseMapping { input, modifier, direction, speed }
+    }
+
+    #[test]
+    fn mouse_moves_while_held_and_disables_xbox_on_same_input() {
+        let mut profile = chord_profile(ModifierMode::LayerOnly);
+        profile.mouse = vec![mouse(TARGET, None, MouseDirection::Left, 50)];
+        let mut state = MapperState::default();
+        let t = Instant::now();
+        let out = state.update(&profile, &buttons(&[1]), t);
+        assert_eq!(out.mouse, (-0.5 * MOUSE_MAX_PX_PER_SEC, 0.0));
+        assert!(!out.report.buttons.contains(X360Button::A), "вход занят мышью");
+        let out = state.update(&profile, &buttons(&[]), ms(t, 10));
+        assert_eq!(out.mouse, (0.0, 0.0), "отпустили — мышь стоит");
+    }
+
+    #[test]
+    fn mouse_works_in_modifier_layer() {
+        let mut profile = chord_profile(ModifierMode::LayerOnly);
+        profile.mouse = vec![
+            mouse(TARGET, None, MouseDirection::Left, 100),
+            mouse(TARGET, Some(0), MouseDirection::Down, 10),
+        ];
+        let mut state = MapperState::default();
+        let t = Instant::now();
+        state.update(&profile, &buttons(&[0]), t);
+        let out = state.update(&profile, &buttons(&[0, 1]), ms(t, 10));
+        assert_eq!(out.mouse, (0.0, 0.1 * MOUSE_MAX_PX_PER_SEC), "в слое — своё направление");
+        assert!(!out.report.buttons.contains(X360Button::B), "B в слое тоже снят мышью");
+        // Модификатор отпустили раньше кнопки — слой держится до отпускания.
+        let out = state.update(&profile, &buttons(&[1]), ms(t, 20));
+        assert_eq!(out.mouse, (0.0, 0.1 * MOUSE_MAX_PX_PER_SEC));
+        state.update(&profile, &buttons(&[]), ms(t, 30));
+        let out = state.update(&profile, &buttons(&[1]), ms(t, 40));
+        assert_eq!(out.mouse, (-MOUSE_MAX_PX_PER_SEC, 0.0), "без модификатора — основной слой");
+    }
+
+    #[test]
+    fn opposite_mouse_directions_cancel() {
+        let mut profile = ControllerProfile::default_for(String::new());
+        profile.entries.clear();
+        profile.mouse = vec![
+            mouse(MODIFIER, None, MouseDirection::Left, 40),
+            mouse(TARGET, None, MouseDirection::Right, 40),
+        ];
+        let out = MapperState::default().update(&profile, &buttons(&[0, 1]), Instant::now());
+        assert_eq!(out.mouse, (0.0, 0.0));
     }
 
     #[test]
