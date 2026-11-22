@@ -634,7 +634,7 @@ pub fn axis_preview(entry: &MappingEntry, raw: &RawState) -> f32 {
         value = -value;
     }
 
-    apply_deadzone(value, entry.deadzone, entry.saturation)
+    apply_deadzone(value, entry.deadzone, entry.saturation, entry.sharpness)
 }
 
 fn axis_value(entry: &MappingEntry, raw: &RawState) -> i16 {
@@ -689,7 +689,7 @@ pub fn trigger_preview(entry: &MappingEntry, raw: &RawState) -> f32 {
     if entry.invert {
         value = 1.0 - value;
     }
-    apply_trigger_deadzone(value, entry.deadzone, entry.saturation)
+    apply_trigger_deadzone(value, entry.deadzone, entry.saturation, entry.sharpness)
 }
 
 fn trigger_value(entry: &MappingEntry, raw: &RawState) -> u8 {
@@ -728,7 +728,7 @@ fn normalized_axis(raw: &RawState, index: u32) -> f32 {
     }
 }
 
-fn apply_deadzone(value: f32, deadzone: f32, saturation: f32) -> f32 {
+fn apply_deadzone(value: f32, deadzone: f32, saturation: f32, sharpness: f32) -> f32 {
     let deadzone = deadzone.clamp(0.0, 0.95);
     let saturation = saturation.clamp(deadzone + 0.01, 1.0);
     let magnitude = value.abs();
@@ -736,17 +736,27 @@ fn apply_deadzone(value: f32, deadzone: f32, saturation: f32) -> f32 {
         return 0.0;
     }
     let scaled = ((magnitude - deadzone) / (saturation - deadzone)).clamp(0.0, 1.0);
-    scaled.copysign(value)
+    response_curve(scaled, sharpness).copysign(value)
 }
 
-fn apply_trigger_deadzone(value: f32, deadzone: f32, saturation: f32) -> f32 {
+fn apply_trigger_deadzone(value: f32, deadzone: f32, saturation: f32, sharpness: f32) -> f32 {
     let deadzone = deadzone.clamp(0.0, 0.95);
     let saturation = saturation.clamp(deadzone + 0.01, 1.0);
     if value <= deadzone {
         0.0
     } else {
-        ((value - deadzone) / (saturation - deadzone)).clamp(0.0, 1.0)
+        response_curve(
+            ((value - deadzone) / (saturation - deadzone)).clamp(0.0, 1.0),
+            sharpness,
+        )
     }
+}
+
+/// Кривая отклика для хода 0..=1: при резкости 100% — линейно, чем меньше,
+/// тем ближе к кубу (у центра мягко, до упора всё равно доходит).
+fn response_curve(travel: f32, sharpness: f32) -> f32 {
+    let sharpness = sharpness.clamp(0.01, 1.0);
+    sharpness * travel + (1.0 - sharpness) * travel * travel * travel
 }
 
 fn button_flag(control: OutputControl) -> X360Button {
@@ -845,8 +855,67 @@ mod tests {
 
     #[test]
     fn deadzone_removes_center_noise() {
-        assert_eq!(apply_deadzone(0.05, 0.12, 1.0), 0.0);
-        assert!(apply_deadzone(0.75, 0.12, 1.0) > 0.6);
+        assert_eq!(apply_deadzone(0.05, 0.12, 1.0, 1.0), 0.0);
+        assert!(apply_deadzone(0.75, 0.12, 1.0, 1.0) > 0.6);
+    }
+
+    #[test]
+    fn deadzone_and_maximum_scale_the_wheel_axis() {
+        let mut entry = MappingEntry::new(
+            OutputControl::LeftStickX,
+            InputBinding::AxisPositive { index: 0 },
+        );
+        entry.deadzone = 0.10;
+        entry.saturation = 0.50;
+        let at = |value: i16| {
+            axis_value(
+                &entry,
+                &RawState {
+                    axes: vec![value],
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(at(3_000), 0); // внутри мёртвой зоны (~9%)
+        assert_eq!(at(16_384), i16::MAX); // 50% хода = максимум
+        assert_eq!(at(-16_384), i16::MIN);
+        let middle = at(9_830) as f32 / 32_767.0; // 30% хода → (0.3-0.1)/0.4 = 0.5
+        assert!((middle - 0.5).abs() < 0.01, "{middle}");
+    }
+
+    #[test]
+    fn lower_sharpness_turns_softer_but_reaches_full_lock() {
+        let soft = |travel: f32, sharpness: f32| apply_deadzone(travel, 0.0, 1.0, sharpness);
+        assert_eq!(soft(0.3, 1.0), 0.3); // 100% — как раньше, линейно
+        assert!(soft(0.3, 0.5) < soft(0.3, 1.0));
+        assert!(soft(0.3, 0.01) < soft(0.3, 0.5));
+        assert!(soft(-0.3, 0.5) < 0.0);
+        assert!((soft(1.0, 0.01) - 1.0).abs() < 1e-6);
+        assert!((apply_trigger_deadzone(1.0, 0.1, 0.9, 0.2) - 1.0).abs() < 1e-6);
+        assert!(apply_trigger_deadzone(0.5, 0.0, 1.0, 0.2) < 0.5);
+    }
+
+    #[test]
+    fn axis_settings_survive_save_and_old_profiles_default_to_linear() {
+        let mut entry = MappingEntry::new(OutputControl::LeftStickX, InputBinding::None);
+        entry.deadzone = 0.03;
+        entry.saturation = 0.8;
+        entry.sharpness = 0.4;
+        let loaded: MappingEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(
+            (loaded.deadzone, loaded.saturation, loaded.sharpness),
+            (0.03, 0.8, 0.4)
+        );
+        let old: MappingEntry =
+            serde_json::from_str(r#"{"control":"left-stick-x","deadzone":0.05}"#).unwrap();
+        assert_eq!(old.sharpness, 1.0);
+
+        entry.reset_axis_settings();
+        assert_eq!(
+            (entry.deadzone, entry.saturation, entry.sharpness),
+            (0.12, 1.0, 1.0)
+        );
     }
 
     #[test]

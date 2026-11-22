@@ -1740,25 +1740,44 @@ impl X360ceApp {
                 }
 
                 let mut changed = false;
+                let mut save_clicked = false;
+                let mut reset_clicked = false;
                 {
                     let mapping = self.edit_entry_mut(control);
                     ui.horizontal_wrapped(|ui| {
                         changed |= ui.checkbox(&mut mapping.invert, "Инвертировать").changed();
                     });
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut mapping.deadzone, 0.0..=0.5)
-                                .text("Мёртвая зона")
-                                .fixed_decimals(2),
+                    changed |= percent_row(ui, "Мёртвая зона", &mut mapping.deadzone, 0..=50)
+                        .on_hover_text("Ход у центра (у покоя), который не учитывается.")
+                        .changed();
+                    changed |= percent_row(ui, "Максимум", &mut mapping.saturation, 50..=100)
+                        .on_hover_text("Доля хода, на которой выход уже 100%.")
+                        .changed();
+                    changed |= percent_row(ui, "Резкость", &mut mapping.sharpness, 1..=100)
+                        .on_hover_text(
+                            "100% — линейно, как раньше. Чем меньше, тем плавнее \
+                             у центра; полный поворот сохраняется.",
                         )
                         .changed();
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut mapping.saturation, 0.5..=1.0)
-                                .text("Максимум")
-                                .fixed_decimals(2),
-                        )
-                        .changed();
+                    ui.horizontal(|ui| {
+                        save_clicked = ui
+                            .button("Сохранить")
+                            .on_hover_text("Записать параметры оси в профиль.")
+                            .clicked();
+                        reset_clicked = ui
+                            .button("Сбросить")
+                            .on_hover_text("Мёртвая зона 12%, максимум 100%, резкость 100%.")
+                            .clicked();
+                    });
+                }
+                if reset_clicked {
+                    self.edit_entry_mut(control).reset_axis_settings();
+                    self.status = format!("{}: параметры оси сброшены.", control.label());
+                    changed = true;
+                }
+                if save_clicked {
+                    self.status = format!("{}: параметры оси сохранены.", control.label());
+                    changed = true;
                 }
                 if changed {
                     self.profile_changed();
@@ -3242,6 +3261,37 @@ fn load_controller_texture(ctx: &egui::Context) -> Option<TextureHandle> {
 }
 
 /// Строка «покой оси / сейчас» для оси назначения. true — нажали «Запомнить».
+/// Ползунок в целых процентах и рядом поле для ввода числа; `value` — доля 0..=1.
+/// Значение пишется только при изменении, чтобы не округлять сохранённое.
+fn percent_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<i32>,
+) -> egui::Response {
+    let mut percent = ((*value * 100.0).round() as i32).clamp(*range.start(), *range.end());
+    let response = ui
+        .horizontal(|ui| {
+            ui.add_sized(
+                [92.0, 18.0],
+                egui::Label::new(RichText::new(label).size(12.0)),
+            );
+            let slider = ui.add(egui::Slider::new(&mut percent, range.clone()).show_value(false));
+            let field = ui.add(
+                egui::DragValue::new(&mut percent)
+                    .range(range)
+                    .speed(0.5)
+                    .suffix(" %"),
+            );
+            slider | field
+        })
+        .inner;
+    if response.changed() {
+        *value = percent as f32 / 100.0;
+    }
+    response
+}
+
 fn rest_row(ui: &mut egui::Ui, raw: &RawState, binding: InputBinding) -> bool {
     let (InputBinding::AxisPositive { index } | InputBinding::AxisNegative { index }) = binding
     else {

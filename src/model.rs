@@ -219,6 +219,9 @@ pub struct MappingEntry {
     pub deadzone: f32,
     #[serde(default = "default_saturation")]
     pub saturation: f32,
+    /// Резкость отклика 0.01..=1.0: 1 — линейно, меньше — плавнее у центра.
+    #[serde(default = "default_sharpness")]
+    pub sharpness: f32,
     /// Тип нажатия; для стиков всегда используется Direct.
     #[serde(default)]
     pub trigger: TriggerType,
@@ -425,6 +428,10 @@ fn default_saturation() -> f32 {
     1.0
 }
 
+fn default_sharpness() -> f32 {
+    1.0
+}
+
 impl MappingEntry {
     /// Назначение читает всю ось (стик или триггер «на всю ось»), а не её половину.
     /// Триггеры и клавиши считают ход оси от покоя в одну сторону (половина),
@@ -444,8 +451,16 @@ impl MappingEntry {
             centered_axis: false,
             deadzone: default_deadzone(),
             saturation: default_saturation(),
+            sharpness: default_sharpness(),
             trigger: TriggerType::Direct,
         }
+    }
+
+    /// Мёртвая зона, максимум и резкость — по умолчанию.
+    pub fn reset_axis_settings(&mut self) {
+        self.deadzone = default_deadzone();
+        self.saturation = default_saturation();
+        self.sharpness = default_sharpness();
     }
 }
 
